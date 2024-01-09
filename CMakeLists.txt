@@ -563,3 +563,11 @@ endif()
 
 add_subdirectory(third_party)
 add_subdirectory(velox)
+
+option(
+        VORTEXDB_EXECUTOR_BUILD
+        "Build vortex executor. This will override other build options."
+        OFF)
+if (VORTEXDB_EXECUTOR_BUILD)
+  add_subdirectory(vortexdb-executor)
+endif ()

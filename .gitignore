@@ -77,6 +77,8 @@ m4/lt~obsolete.m4
 # Build artifacts
 #==============================================================================#
 #m4/
+cmake-*
+build-*
 build/
 _build/
 .ccache/
