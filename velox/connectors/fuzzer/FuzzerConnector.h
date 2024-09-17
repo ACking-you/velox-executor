@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/common/config/Config.h"
 #include "velox/connectors/Connector.h"
 #include "velox/connectors/fuzzer/FuzzerConnectorSplit.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
@@ -56,7 +57,7 @@ class FuzzerDataSource : public DataSource {
   FuzzerDataSource(
       const std::shared_ptr<const RowType>& outputType,
       const std::shared_ptr<connector::ConnectorTableHandle>& tableHandle,
-      velox::memory::MemoryPool* FOLLY_NONNULL pool);
+      velox::memory::MemoryPool* pool);
 
   void addSplit(std::shared_ptr<ConnectorSplit> split) override;
 
@@ -96,15 +97,15 @@ class FuzzerDataSource : public DataSource {
   size_t completedRows_{0};
   size_t completedBytes_{0};
 
-  memory::MemoryPool* FOLLY_NONNULL pool_;
+  memory::MemoryPool* pool_;
 };
 
 class FuzzerConnector final : public Connector {
  public:
   FuzzerConnector(
       const std::string& id,
-      std::shared_ptr<const Config> config,
-      folly::Executor* FOLLY_NULLABLE /*executor*/)
+      std::shared_ptr<const config::ConfigBase> config,
+      folly::Executor* /*executor*/)
       : Connector(id) {}
 
   std::unique_ptr<DataSource> createDataSource(
@@ -113,7 +114,7 @@ class FuzzerConnector final : public Connector {
       const std::unordered_map<
           std::string,
           std::shared_ptr<connector::ColumnHandle>>& /*columnHandles*/,
-      ConnectorQueryCtx* FOLLY_NONNULL connectorQueryCtx) override final {
+      ConnectorQueryCtx* connectorQueryCtx) override final {
     return std::make_unique<FuzzerDataSource>(
         outputType, tableHandle, connectorQueryCtx->memoryPool());
   }
@@ -130,17 +131,17 @@ class FuzzerConnector final : public Connector {
 
 class FuzzerConnectorFactory : public ConnectorFactory {
  public:
-  static constexpr const char* FOLLY_NONNULL kFuzzerConnectorName{"fuzzer"};
+  static constexpr const char* kFuzzerConnectorName{"fuzzer"};
 
   FuzzerConnectorFactory() : ConnectorFactory(kFuzzerConnectorName) {}
 
-  explicit FuzzerConnectorFactory(const char* FOLLY_NONNULL connectorName)
+  explicit FuzzerConnectorFactory(const char* connectorName)
       : ConnectorFactory(connectorName) {}
 
   std::shared_ptr<Connector> newConnector(
       const std::string& id,
-      std::shared_ptr<const Config> config,
-      folly::Executor* FOLLY_NULLABLE executor = nullptr) override {
+      std::shared_ptr<const config::ConfigBase> config,
+      folly::Executor* executor = nullptr) override {
     return std::make_shared<FuzzerConnector>(id, config, executor);
   }
 };

@@ -25,10 +25,6 @@ namespace {
 template <bool EmptyForNull>
 class MapConcatFunction : public exec::VectorFunction {
  public:
-  bool isDefaultNullBehavior() const override {
-    return !EmptyForNull;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -161,12 +157,11 @@ class MapConcatFunction : public exec::VectorFunction {
   static std::vector<std::shared_ptr<exec::FunctionSignature>> signatures() {
     // map(K,V), map(K,V), ... -> map(K,V)
     return {exec::FunctionSignatureBuilder()
-                .knownTypeVariable("K")
+                .typeVariable("K")
                 .typeVariable("V")
                 .returnType("map(K,V)")
                 .argumentType("map(K,V)")
-                .argumentType("map(K,V)")
-                .variableArity()
+                .variableArity("map(K,V)")
                 .build()};
   }
 };
@@ -183,6 +178,7 @@ void registerMapConcatEmptyNullsFunction(const std::string& name) {
   exec::registerVectorFunction(
       name,
       MapConcatFunction</*EmptyForNull=*/true>::signatures(),
-      std::make_unique<MapConcatFunction</*EmptyForNull=*/true>>());
+      std::make_unique<MapConcatFunction</*EmptyForNull=*/true>>(),
+      exec::VectorFunctionMetadataBuilder().defaultNullBehavior(false).build());
 }
 } // namespace facebook::velox::functions

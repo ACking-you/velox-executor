@@ -94,7 +94,7 @@ class AggregationFuzzerRunner {
       exit(1);
     }
 
-    auto filteredSignatures = velox::test::filterSignatures(
+    auto filteredSignatures = velox::fuzzer::filterSignatures(
         signatures, options.onlyFunctions, options.skipFunctions);
     if (filteredSignatures.empty()) {
       LOG(ERROR)
@@ -114,6 +114,8 @@ class AggregationFuzzerRunner {
         options.customInputGenerators,
         options.timestampPrecision,
         options.queryConfigs,
+        options.hiveConfigs,
+        options.orderableGroupKeys,
         planPath,
         std::move(referenceQueryRunner));
     // Calling gtest here so that it can be recognized as tests in CI systems.

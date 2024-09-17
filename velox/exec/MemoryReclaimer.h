@@ -16,12 +16,10 @@
 
 #pragma once
 
-#include "velox/common/base/Exceptions.h"
-#include "velox/common/base/Portability.h"
 #include "velox/common/memory/MemoryArbitrator.h"
 
 namespace facebook::velox::exec {
-/// Provides the default memory reclaimer implementation for velox task
+/// Provides the default leaf memory reclaimer implementation for velox task
 /// execution.
 class MemoryReclaimer : public memory::MemoryReclaimer {
  public:
@@ -40,6 +38,28 @@ class MemoryReclaimer : public memory::MemoryReclaimer {
   MemoryReclaimer() = default;
 };
 
+/// Provides the parallel memory reclaimer implementation for velox task
+/// execution. It parallelize the memory reclamation from all its child memory
+/// pools.
+class ParallelMemoryReclaimer : public memory::MemoryReclaimer {
+ public:
+  virtual ~ParallelMemoryReclaimer() = default;
+
+  static std::unique_ptr<memory::MemoryReclaimer> create(
+      folly::Executor* executor);
+
+  uint64_t reclaim(
+      memory::MemoryPool* pool,
+      uint64_t targetBytes,
+      uint64_t maxWaitMs,
+      Stats& stats) override;
+
+ protected:
+  explicit ParallelMemoryReclaimer(folly::Executor* executor);
+
+  folly::Executor* const executor_{nullptr};
+};
+
 /// Callback used by memory arbitration to check if a driver thread under memory
 /// arbitration has been put in suspension state. This is to prevent arbitration
 /// deadlock as the arbitrator might reclaim memory from the task of the driver
@@ -47,43 +67,4 @@ class MemoryReclaimer : public memory::MemoryReclaimer {
 /// drivers to go off thread. A suspended driver thread is not counted as
 /// running.
 void memoryArbitrationStateCheck(memory::MemoryPool& pool);
-
-/// The object is used to set/clear non-reclaimable section of an operation in
-/// the middle of its execution. It allows the memory arbitrator to reclaim
-/// memory from a running operator which is waiting for memory arbitration.
-/// 'nonReclaimableSection' points to the corresponding flag of the associated
-/// operator.
-class ReclaimableSectionGuard {
- public:
-  explicit ReclaimableSectionGuard(tsan_atomic<bool>* nonReclaimableSection)
-      : nonReclaimableSection_(nonReclaimableSection),
-        oldMonReclaimableSectionValue_(*nonReclaimableSection_) {
-    *nonReclaimableSection_ = false;
-  }
-
-  ~ReclaimableSectionGuard() {
-    *nonReclaimableSection_ = oldMonReclaimableSectionValue_;
-  }
-
- private:
-  tsan_atomic<bool>* const nonReclaimableSection_;
-  const bool oldMonReclaimableSectionValue_;
-};
-
-class NonReclaimableSectionGuard {
- public:
-  explicit NonReclaimableSectionGuard(tsan_atomic<bool>* nonReclaimableSection)
-      : nonReclaimableSection_(nonReclaimableSection),
-        oldMonReclaimableSectionValue_(*nonReclaimableSection_) {
-    *nonReclaimableSection_ = true;
-  }
-
-  ~NonReclaimableSectionGuard() {
-    *nonReclaimableSection_ = oldMonReclaimableSectionValue_;
-  }
-
- private:
-  tsan_atomic<bool>* const nonReclaimableSection_;
-  const bool oldMonReclaimableSectionValue_;
-};
 } // namespace facebook::velox::exec

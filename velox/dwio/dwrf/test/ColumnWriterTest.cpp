@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <optional>
 #include <vector>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/dwio/common/IntDecoder.h"
 #include "velox/dwio/common/TypeWithId.h"
@@ -104,12 +105,7 @@ class TestStripeStreams : public StripeStreamsBase {
     }
     if (!stream || stream->isSuppressed()) {
       if (throwIfNotFound) {
-        DWIO_RAISE(fmt::format(
-            "stream (node = {}, seq = {}, column = {}, kind = {}) not found",
-            si.encodingKey().node(),
-            si.encodingKey().sequence(),
-            si.column(),
-            si.kind()));
+        DWIO_RAISE(fmt::format("stream {} not found", si.toString()));
       } else {
         return nullptr;
       }
@@ -158,7 +154,7 @@ class TestStripeStreams : public StripeStreamsBase {
     return selector_;
   }
 
-  const RowReaderOptions& getRowReaderOptions() const override {
+  const RowReaderOptions& rowReaderOptions() const override {
     return options_;
   }
 
@@ -363,9 +359,9 @@ void testDataTypeWriter(
     }
     // Reader API requires the caller to read the Stripe for number of
     // values and iterate only until that number.
-    // It does not support hasNext/next protocol.
+    // It does notd support hasNext/next protocol.
     // Use a bigger number like 50, as some values may be bit packed.
-    EXPECT_THROW({ reader->next(50, out); }, exception::LoggedException);
+    VELOX_ASSERT_THROW(reader->next(50, out), "");
 
     context.nextStripe();
     writer->reset();
@@ -389,6 +385,36 @@ TEST_F(ColumnWriterTest, LowMemoryModeConfig) {
   context.initBuffer();
   auto writer = BaseColumnWriter::create(context, *dataTypeWithId);
   EXPECT_TRUE(writer->useDictionaryEncoding());
+}
+
+TEST_F(ColumnWriterTest, IntegerDictionaryEncodingEnabledConfig) {
+  auto dataTypeWithId = TypeWithId::create(INTEGER(), 1);
+  auto config = std::make_shared<Config>();
+  config->set(Config::INTEGER_DICTIONARY_ENCODING_ENABLED, true);
+  WriterContext context{config, memory::memoryManager()->addRootPool()};
+  context.initBuffer();
+  auto writer = BaseColumnWriter::create(context, *dataTypeWithId);
+  EXPECT_TRUE(writer->useDictionaryEncoding());
+
+  dataTypeWithId = TypeWithId::create(INTEGER(), 2);
+  config->set(Config::INTEGER_DICTIONARY_ENCODING_ENABLED, false);
+  writer = BaseColumnWriter::create(context, *dataTypeWithId);
+  EXPECT_FALSE(writer->useDictionaryEncoding());
+}
+
+TEST_F(ColumnWriterTest, StringDictionaryEncodingEnabledConfig) {
+  auto dataTypeWithId = TypeWithId::create(VARCHAR(), 1);
+  auto config = std::make_shared<Config>();
+  config->set(Config::STRING_DICTIONARY_ENCODING_ENABLED, true);
+  WriterContext context{config, memory::memoryManager()->addRootPool()};
+  context.initBuffer();
+  auto writer = BaseColumnWriter::create(context, *dataTypeWithId);
+  EXPECT_TRUE(writer->useDictionaryEncoding());
+
+  dataTypeWithId = TypeWithId::create(VARCHAR(), 2);
+  config->set(Config::STRING_DICTIONARY_ENCODING_ENABLED, false);
+  writer = BaseColumnWriter::create(context, *dataTypeWithId);
+  EXPECT_FALSE(writer->useDictionaryEncoding());
 }
 
 TEST_F(ColumnWriterTest, TestBooleanWriter) {
@@ -846,15 +872,14 @@ void mapToStruct(
   }
 }
 
-template <typename TKEY, typename TVALUE>
+template <typename TKEY, typename TVALUE, bool useStruct = false>
 void testMapWriter(
     MemoryPool& pool,
     const std::vector<VectorPtr>& batches,
     bool useFlatMap,
     bool disableDictionaryEncoding,
     bool testEncoded,
-    bool printMaps = true,
-    bool useStruct = false) {
+    bool printMaps = true) {
   const auto rowType = CppToType<Row<Map<TKEY, TVALUE>>>::create();
   const auto dataType = rowType->childAt(0);
   const auto rowTypeWithId = TypeWithId::create(rowType);
@@ -871,7 +896,7 @@ void testMapWriter(
   std::vector<VectorPtr> structs;
   std::unordered_map<uint32_t, std::vector<std::string>> structReaderContext;
   if (useFlatMap) {
-    if (useStruct) {
+    if constexpr (useStruct) {
       structs = batches;
       pBatches = &structs;
       std::vector<TKEY> uniqueKeys;
@@ -972,7 +997,7 @@ void testMapWriter(
       // values and iterate only until that number.
       // It does not support hasNext/next protocol.
       // Use a bigger number like 50, as some values may be bit packed.
-      EXPECT_THROW({ reader->next(50, out); }, exception::LoggedException);
+      VELOX_ASSERT_THROW(reader->next(50, out), "");
     };
 
     ASSERT_NO_FATAL_FAILURE(validate());
@@ -1104,7 +1129,7 @@ void testMapWriterRow(
       // values and iterate only until that number.
       // It does not support hasNext/next protocol.
       // Use a bigger number like 50, as some values may be bit packed.
-      EXPECT_THROW({ reader->next(50, out); }, exception::LoggedException);
+      VELOX_ASSERT_THROW(reader->next(50, out), "");
     };
 
     ASSERT_NO_FATAL_FAILURE(validate());
@@ -1163,26 +1188,25 @@ TEST_F(ColumnWriterTest, TestMapWriterNestedRow) {
   testMapWriterRowImpl<Row<int32_t, bool, StringView>>();
 }
 
-template <typename TKEY, typename TVALUE>
+template <typename TKEY, typename TVALUE, bool useStruct = false>
 void testMapWriter(
     MemoryPool& pool,
     const VectorPtr& batch,
     bool useFlatMap,
-    bool printMaps = true,
-    bool useStruct = false) {
+    bool printMaps = true) {
   std::vector<VectorPtr> batches{batch, batch};
-  testMapWriter<TKEY, TVALUE>(
-      pool, batches, useFlatMap, true, false, printMaps, useStruct);
+  testMapWriter<TKEY, TVALUE, useStruct>(
+      pool, batches, useFlatMap, true, false, printMaps);
   if (useFlatMap) {
-    testMapWriter<TKEY, TVALUE>(
-        pool, batches, useFlatMap, false, false, printMaps, useStruct);
-    testMapWriter<TKEY, TVALUE>(
-        pool, batches, useFlatMap, true, true, printMaps, useStruct);
+    testMapWriter<TKEY, TVALUE, useStruct>(
+        pool, batches, useFlatMap, false, false, printMaps);
+    testMapWriter<TKEY, TVALUE, useStruct>(
+        pool, batches, useFlatMap, true, true, printMaps);
   }
 }
 
-template <typename T>
-void testMapWriterNumericKey(bool useFlatMap, bool useStruct = false) {
+template <typename T, bool useStruct = false>
+void testMapWriterNumericKey(bool useFlatMap) {
   using b = MapBuilder<T, T>;
 
   auto pool = memory::memoryManager()->addLeafPool();
@@ -1196,7 +1220,14 @@ void testMapWriterNumericKey(bool useFlatMap, bool useStruct = false) {
            typename b::pair{
                std::numeric_limits<T>::min(), std::numeric_limits<T>::min()}}});
 
-  testMapWriter<T, T>(*pool, batch, useFlatMap, true, useStruct);
+  testMapWriter<T, T, useStruct>(*pool, batch, useFlatMap, true);
+}
+
+// Workaround to avoid issues with two template arguments when wrapped in gtest
+// EXPECT macros.
+template <typename T>
+void testMapWriterNumericKeyUseStruct(bool useFlatMap) {
+  testMapWriterNumericKey<T, true>(useFlatMap);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterFloatKey) {
@@ -1208,8 +1239,8 @@ TEST_F(ColumnWriterTest, TestMapWriterFloatKey) {
 
   EXPECT_THROW(
       {
-        testMapWriterNumericKey<float>(
-            /* useFlatMap */ true, /* useStruct */ true);
+        testMapWriterNumericKeyUseStruct<float>(
+            /* useFlatMap */ true);
       },
       exception::LoggedException);
 }
@@ -1217,25 +1248,41 @@ TEST_F(ColumnWriterTest, TestMapWriterFloatKey) {
 TEST_F(ColumnWriterTest, TestMapWriterInt64Key) {
   testMapWriterNumericKey<int64_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int64_t>(/* useFlatMap */ true);
-  testMapWriterNumericKey<int64_t>(/* useFlatMap */ true, /* useStruct */ true);
+  testMapWriterNumericKeyUseStruct<int64_t>(/* useFlatMap */ true);
+}
+
+TEST_F(ColumnWriterTest, TestMapWriterDuplicatedInt64Key) {
+  using T = int64_t;
+  using b = MapBuilder<T, T>;
+
+  auto pool = memory::memoryManager()->addLeafPool();
+  auto batch = b::create(
+      *pool, {typename b::row{typename b::pair{5, 3}, typename b::pair{5, 4}}});
+
+  EXPECT_THAT(
+      ([&]() { testMapWriter<T, T>(*pool, batch, /* useFlatMap */ true); }),
+      Throws<
+          facebook::velox::dwio::common::exception::LoggedException>(Property(
+          &facebook::velox::dwio::common::exception::LoggedException::message,
+          HasSubstr("Duplicated key in map: 5"))));
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt32Key) {
   testMapWriterNumericKey<int32_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int32_t>(/* useFlatMap */ true);
-  testMapWriterNumericKey<int32_t>(/* useFlatMap */ true, /* useStruct */ true);
+  testMapWriterNumericKeyUseStruct<int32_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt16Key) {
   testMapWriterNumericKey<int16_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int16_t>(/* useFlatMap */ true);
-  testMapWriterNumericKey<int16_t>(/* useFlatMap */ true, /* useStruct */ true);
+  testMapWriterNumericKeyUseStruct<int16_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterInt8Key) {
   testMapWriterNumericKey<int8_t>(/* useFlatMap */ false);
   testMapWriterNumericKey<int8_t>(/* useFlatMap */ true);
-  testMapWriterNumericKey<int8_t>(/* useFlatMap */ true, /* useStruct */ true);
+  testMapWriterNumericKeyUseStruct<int8_t>(/* useFlatMap */ true);
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterStringKey) {
@@ -1251,8 +1298,28 @@ TEST_F(ColumnWriterTest, TestMapWriterStringKey) {
 
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ false);
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
-  testMapWriter<keyType, valueType>(
-      *pool_, batch, /* useFlatMap */ true, true, /* useStruct */ true);
+  testMapWriter<keyType, valueType, /* useStruct */ true>(
+      *pool_, batch, /* useFlatMap */ true, true);
+}
+
+TEST_F(ColumnWriterTest, TestMapWriterDuplicatedStringKey) {
+  using keyType = StringView;
+  using valueType = StringView;
+  using b = MapBuilder<keyType, valueType>;
+
+  auto pool = memory::memoryManager()->addLeafPool();
+  auto batch = b::create(
+      *pool_,
+      {b::row{b::pair{"2", "5"}, b::pair{"2", "8"}}}); // Duplicated key: 2
+
+  EXPECT_THAT(
+      ([&]() {
+        testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
+      }),
+      Throws<
+          facebook::velox::dwio::common::exception::LoggedException>(Property(
+          &facebook::velox::dwio::common::exception::LoggedException::message,
+          HasSubstr("Duplicated key in map: 2"))));
 }
 
 TEST_F(ColumnWriterTest, TestMapWriterDifferentNumericKeyValue) {
@@ -1328,8 +1395,8 @@ TEST_F(ColumnWriterTest, TestMapWriterBinaryKey) {
 
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ false);
   testMapWriter<keyType, valueType>(*pool_, batch, /* useFlatMap */ true);
-  testMapWriter<keyType, valueType>(
-      *pool_, batch, /* useFlatMap */ true, true, /* useStruct */ true);
+  testMapWriter<keyType, valueType, /* useStruct */ true>(
+      *pool_, batch, /* useFlatMap */ true, true);
 }
 
 template <typename keyType, typename valueType>
@@ -1562,13 +1629,13 @@ std::unique_ptr<DwrfReader> getDwrfReader(
   writer.write(batch);
   writer.close();
 
-  std::string_view data(sinkPtr->data(), sinkPtr->size());
+  std::string data(sinkPtr->data(), sinkPtr->size());
   dwio::common::ReaderOptions readerOpts{&leafPool};
   return std::make_unique<DwrfReader>(
       readerOpts,
       std::make_unique<BufferedInput>(
-          std::make_shared<InMemoryReadFile>(data),
-          readerOpts.getMemoryPool()));
+          std::make_shared<InMemoryReadFile>(std::move(data)),
+          readerOpts.memoryPool()));
 }
 
 void removeSizeFromStats(std::string& input) {
@@ -4244,7 +4311,7 @@ TEST_F(ColumnWriterTest, ColumnIdInStream) {
   const uint32_t kColumnId = 2;
   auto typeWithId = std::make_shared<const TypeWithId>(
       type,
-      std::vector<std::shared_ptr<const TypeWithId>>{},
+      std::vector<std::unique_ptr<TypeWithId>>{},
       /* id */ kNodeId,
       /* maxId */ kNodeId,
       /* column */ kColumnId);
@@ -4266,7 +4333,7 @@ TEST_F(ColumnWriterTest, ColumnIdInStream) {
   ASSERT_NE(streams.getStream(si, {}, false), nullptr);
 }
 
-template <typename T>
+template <typename T, bool isComplexTypeT>
 struct DictColumnWriterTestCase {
   DictColumnWriterTestCase(size_t size, bool writeDirect, const TypePtr& type)
       : size_(size), writeDirect_(writeDirect), type_(type) {}
@@ -4335,6 +4402,7 @@ struct DictColumnWriterTestCase {
    * Map)
    * @return
    */
+  template <bool isComplexRowType = false>
   VectorPtr createDictionaryBatch(
       size_t size,
       std::function<T(vector_size_t /*index*/)> valueAt,
@@ -4344,10 +4412,10 @@ struct DictColumnWriterTestCase {
     VectorPtr dictionaryVector;
 
     VectorPtr flatVector;
-    if (complexRowType == nullptr) {
-      flatVector = makeFlatVector(size, valueAt, isNullAt);
-    } else {
+    if constexpr (isComplexRowType) {
       flatVector = makeComplexVectors(complexRowType, size, isNullAt);
+    } else {
+      flatVector = makeFlatVector(size, valueAt, isNullAt);
     }
 
     auto wrappedVector = BaseVector::wrapInDictionary(
@@ -4366,14 +4434,12 @@ struct DictColumnWriterTestCase {
     WriterContext context{config, memory::memoryManager()->addRootPool()};
     context.initBuffer();
 
-    // complexVectorType will be nullptr if the vector is not complex.
-    bool isComplexType = std::dynamic_pointer_cast<const RowType>(type_) ||
-        std::dynamic_pointer_cast<const MapType>(type_) ||
-        std::dynamic_pointer_cast<const ArrayType>(type_);
-
-    auto complexVectorType = isComplexType ? rowType : nullptr;
-    auto batch =
-        createDictionaryBatch(size_, valueAt, isNullAt, complexVectorType);
+    VectorPtr batch;
+    if constexpr (isComplexTypeT) {
+      batch = createDictionaryBatch<true>(size_, valueAt, isNullAt, rowType);
+    } else {
+      batch = createDictionaryBatch<false>(size_, valueAt, isNullAt);
+    }
 
     const auto writer = BaseColumnWriter::create(context, *typeWithId);
 
@@ -4423,7 +4489,7 @@ std::function<bool(vector_size_t /*index*/)> randomNulls(int32_t n) {
       [n](vector_size_t /*index*/) { return folly::Random::rand32() % n == 0; };
 }
 
-template <typename T>
+template <typename T, bool isComplexTypeT = false>
 void testDictionary(
     const TypePtr& type,
     std::function<bool(vector_size_t)> isNullAt = nullptr,
@@ -4431,18 +4497,17 @@ void testDictionary(
   constexpr int32_t vectorSize = 200;
 
   // Tests for null/non null data with direct or dict write
-  DictColumnWriterTestCase<T>(vectorSize, true, type)
+  DictColumnWriterTestCase<T, isComplexTypeT>(vectorSize, true, type)
       .runTest(valueAt, isNullAt);
 
-  DictColumnWriterTestCase<T>(vectorSize, false, type)
+  DictColumnWriterTestCase<T, isComplexTypeT>(vectorSize, false, type)
       .runTest(valueAt, isNullAt);
 
   // Tests for non null data with direct or dict write
-  DictColumnWriterTestCase<T>(vectorSize, true, type).runTest(valueAt, [](int) {
-    return false;
-  });
+  DictColumnWriterTestCase<T, isComplexTypeT>(vectorSize, true, type)
+      .runTest(valueAt, [](int) { return false; });
 
-  DictColumnWriterTestCase<T>(vectorSize, false, type)
+  DictColumnWriterTestCase<T, isComplexTypeT>(vectorSize, false, type)
       .runTest(valueAt, [](int) { return false; });
 }
 
@@ -4486,27 +4551,28 @@ TEST_F(ColumnWriterTest, rowDictionary) {
   // randomly
 
   // Row tests
-  testDictionary<Row<int32_t>>(ROW({INTEGER()}), randomNulls(5));
+  testDictionary<Row<int32_t>, true>(ROW({INTEGER()}), randomNulls(5));
 
-  testDictionary<Row<StringView, int32_t>>(
+  testDictionary<Row<StringView, int32_t>, true>(
       ROW({VARCHAR(), INTEGER()}), randomNulls(11));
 
-  testDictionary<Row<Row<StringView, int32_t>>>(
+  testDictionary<Row<Row<StringView, int32_t>>, true>(
       ROW({ROW({VARCHAR(), INTEGER()})}), randomNulls(11));
 
-  testDictionary<Row<int32_t, double, StringView>>(
+  testDictionary<Row<int32_t, double, StringView>, true>(
       ROW({INTEGER(), DOUBLE(), VARCHAR()}), randomNulls(5));
 
-  testDictionary<Row<int32_t, StringView, double, StringView>>(
+  testDictionary<Row<int32_t, StringView, double, StringView>, true>(
       ROW({INTEGER(), VARCHAR(), DOUBLE(), VARCHAR()}), randomNulls(5));
 
-  testDictionary<Row<Array<StringView>, StringView>>(
+  testDictionary<Row<Array<StringView>, StringView>, true>(
       ROW({ARRAY(VARCHAR()), VARCHAR()}), randomNulls(11));
 
   testDictionary<
       Row<Map<int32_t, double>,
           Array<Map<int32_t, Row<int32_t, double>>>,
-          Row<int32_t, StringView>>>(
+          Row<int32_t, StringView>>,
+      true>(
       ROW(
           {MAP(INTEGER(), DOUBLE()),
            ARRAY(MAP(INTEGER(), ROW({INTEGER(), DOUBLE()}))),
@@ -4516,17 +4582,19 @@ TEST_F(ColumnWriterTest, rowDictionary) {
 
 TEST_F(ColumnWriterTest, arrayDictionary) {
   // Array tests
-  testDictionary<Array<float>>(ARRAY(REAL()), randomNulls(7));
+  testDictionary<Array<float>, true>(ARRAY(REAL()), randomNulls(7));
 
   testDictionary<
-      Row<Array<int32_t>, Row<StringView, Array<Map<StringView, StringView>>>>>(
+      Row<Array<int32_t>, Row<StringView, Array<Map<StringView, StringView>>>>,
+      true>(
       ROW(
           {ARRAY(INTEGER()),
            ROW({VARCHAR(), ARRAY(MAP(VARCHAR(), VARCHAR()))})}),
       randomNulls(11));
 
   testDictionary<
-      Array<Map<int32_t, Array<Map<int8_t, Row<StringView, Array<double>>>>>>>(
+      Array<Map<int32_t, Array<Map<int8_t, Row<StringView, Array<double>>>>>>,
+      true>(
       ARRAY(MAP(
           INTEGER(), ARRAY(MAP(TINYINT(), ROW({VARCHAR(), ARRAY(DOUBLE())}))))),
       randomNulls(7));
@@ -4534,20 +4602,21 @@ TEST_F(ColumnWriterTest, arrayDictionary) {
 
 TEST_F(ColumnWriterTest, mapDictionary) {
   // Map tests
-  testDictionary<Map<int32_t, double>>(
+  testDictionary<Map<int32_t, double>, true>(
       MAP(INTEGER(), DOUBLE()), randomNulls(7));
 
-  testDictionary<Map<StringView, StringView>>(
+  testDictionary<Map<StringView, StringView>, true>(
       MAP(VARCHAR(), VARCHAR()), randomNulls(13));
 
   testDictionary<
       Map<StringView,
-          Map<int32_t, Array<Row<int32_t, int32_t, Array<double>>>>>>(
+          Map<int32_t, Array<Row<int32_t, int32_t, Array<double>>>>>,
+      true>(
       MAP(VARCHAR(),
           MAP(INTEGER(), ARRAY(ROW({INTEGER(), INTEGER(), ARRAY(DOUBLE())})))),
       randomNulls(9));
 
-  testDictionary<Map<int32_t, Map<StringView, Map<StringView, int8_t>>>>(
+  testDictionary<Map<int32_t, Map<StringView, Map<StringView, int8_t>>>, true>(
       MAP(INTEGER(), MAP(VARCHAR(), MAP(VARCHAR(), TINYINT()))),
       randomNulls(3));
 }

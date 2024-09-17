@@ -15,6 +15,7 @@
  */
 
 #include "velox/dwio/common/Reader.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <gtest/gtest.h>
@@ -31,6 +32,35 @@ class ReaderTest : public testing::Test, public test::VectorTestBase {
   }
 };
 
+TEST_F(ReaderTest, getOrCreateChild) {
+  constexpr int kSize = 5;
+  auto input = makeRowVector(
+      {"c.0", "c.1"},
+      {
+          makeFlatVector<int64_t>({1, 2, 3, 4, 5}),
+          makeFlatVector<int64_t>({2, 4, 6, 7, 8}),
+      });
+
+  common::ScanSpec spec("<root>");
+  spec.addField("c.0", 0);
+  // Create child from name.
+  spec.getOrCreateChild("c.1")->setFilter(
+      common::createBigintValues({2, 4, 6}, false));
+
+  auto actual = RowReader::projectColumns(input, spec, nullptr);
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+  });
+  test::assertEqualVectors(expected, actual);
+
+  // Create child from subfield.
+  spec.getOrCreateChild(common::Subfield("c.1"))
+      ->setFilter(common::createBigintValues({2, 4, 6}, false));
+  VELOX_ASSERT_USER_THROW(
+      RowReader::projectColumns(input, spec, nullptr),
+      "Field not found: c. Available fields are: c.0, c.1.");
+}
+
 TEST_F(ReaderTest, projectColumnsFilterStruct) {
   constexpr int kSize = 10;
   auto input = makeRowVector({
@@ -43,7 +73,7 @@ TEST_F(ReaderTest, projectColumnsFilterStruct) {
   spec.addField("c0", 0);
   spec.getOrCreateChild(common::Subfield("c1.c0"))
       ->setFilter(common::createBigintValues({2, 4, 6}, false));
-  auto actual = RowReader::projectColumns(input, spec);
+  auto actual = RowReader::projectColumns(input, spec, nullptr);
   auto expected = makeRowVector({
       makeFlatVector<int64_t>({2, 4, 6}),
   });
@@ -66,7 +96,7 @@ TEST_F(ReaderTest, projectColumnsFilterArray) {
   {
     SCOPED_TRACE("IS NULL");
     c1->setFilter(std::make_unique<common::IsNull>());
-    auto actual = RowReader::projectColumns(input, spec);
+    auto actual = RowReader::projectColumns(input, spec, nullptr);
     auto expected = makeRowVector({
         makeFlatVector<int64_t>({1, 3, 5, 7, 9}),
     });
@@ -75,12 +105,36 @@ TEST_F(ReaderTest, projectColumnsFilterArray) {
   {
     SCOPED_TRACE("IS NOT NULL");
     c1->setFilter(std::make_unique<common::IsNotNull>());
-    auto actual = RowReader::projectColumns(input, spec);
+    auto actual = RowReader::projectColumns(input, spec, nullptr);
     auto expected = makeRowVector({
         makeFlatVector<int64_t>({0, 2, 4, 6, 8}),
     });
     test::assertEqualVectors(expected, actual);
   }
+}
+
+TEST_F(ReaderTest, projectColumnsMutation) {
+  constexpr int kSize = 10;
+  auto input = makeRowVector({makeFlatVector<int64_t>(kSize, folly::identity)});
+  common::ScanSpec spec("<root>");
+  spec.addAllChildFields(*input->type());
+  std::vector<uint64_t> deleted(bits::nwords(kSize));
+  bits::setBit(deleted.data(), 2);
+  Mutation mutation;
+  mutation.deletedRows = deleted.data();
+  auto actual = RowReader::projectColumns(input, spec, &mutation);
+  auto expected = makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 3, 4, 5, 6, 7, 8, 9}),
+  });
+  test::assertEqualVectors(expected, actual);
+  random::setSeed(42);
+  random::RandomSkipTracker randomSkip(0.5);
+  mutation.randomSkip = &randomSkip;
+  actual = RowReader::projectColumns(input, spec, &mutation);
+  expected = makeRowVector({
+      makeFlatVector<int64_t>({0, 1, 3, 5, 6, 8}),
+  });
+  test::assertEqualVectors(expected, actual);
 }
 
 } // namespace

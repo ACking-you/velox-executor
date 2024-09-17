@@ -74,7 +74,7 @@ void transferVector(
     std::vector<WaveVectorPtr>& waveVectors,
     std::vector<Operand>& operands,
     GpuArena& arena,
-    int64_t totalBytes) {
+    int64_t& totalBytes) {
   if (waveVectors.size() <= index) {
     waveVectors.resize(index + 1);
   }
@@ -119,18 +119,8 @@ void vectorsToDevice(
     transferVector(
         source[i], i, transfers, waveVectors, operandVector, arena, bytes);
   }
-  auto operands = arena.allocate<Operand>(operandVector.size());
-  memcpy(
-      operands->as<Operand>(),
-      operandVector.data(),
-      operandVector.size() * sizeof(Operand));
-  operandVector.clear();
   Executable::startTransfer(
-      ids,
-      std::move(operands),
-      std::move(waveVectors),
-      std::move(transfers),
-      stream);
+      ids, std::move(waveVectors), std::move(transfers), stream);
 }
 
 // Patches the position 'ofet' in 'code' to be a new uninitialized device

@@ -43,12 +43,14 @@ SortWindowBuild::SortWindowBuild(
     const std::shared_ptr<const core::WindowNode>& node,
     velox::memory::MemoryPool* pool,
     const common::SpillConfig* spillConfig,
-    tsan_atomic<bool>* nonReclaimableSection)
+    tsan_atomic<bool>* nonReclaimableSection,
+    folly::Synchronized<common::SpillStats>* spillStats)
     : WindowBuild(node, pool, spillConfig, nonReclaimableSection),
       numPartitionKeys_{node->partitionKeys().size()},
       spillCompareFlags_{
           makeSpillCompareFlags(numPartitionKeys_, node->sortingOrders())},
-      pool_(pool) {
+      pool_(pool),
+      spillStats_(spillStats) {
   VELOX_CHECK_NOT_NULL(pool_);
   allKeyInfo_.reserve(partitionKeyInfo_.size() + sortKeyInfo_.size());
   allKeyInfo_.insert(
@@ -88,7 +90,7 @@ void SortWindowBuild::ensureInputFits(const RowVectorPtr& input) {
   }
 
   // Test-only spill path.
-  if (spillConfig_->testSpillPct > 0) {
+  if (testingTriggerSpill(pool_->name())) {
     spill();
     return;
   }
@@ -98,7 +100,7 @@ void SortWindowBuild::ensureInputFits(const RowVectorPtr& input) {
       data_->stringAllocator().retainedSize() - outOfLineFreeBytes;
   const auto outOfLineBytesPerRow = outOfLineBytes / data_->numRows();
 
-  const auto currentUsage = data_->pool()->currentBytes();
+  const auto currentUsage = data_->pool()->usedBytes();
   const auto minReservationBytes =
       currentUsage * spillConfig_->minSpillableReservationPct / 100;
   const auto availableReservationBytes = data_->pool()->availableReservation();
@@ -122,7 +124,7 @@ void SortWindowBuild::ensureInputFits(const RowVectorPtr& input) {
       incrementBytes * 2,
       currentUsage * spillConfig_->spillableReservationGrowthPct / 100);
   {
-    ReclaimableSectionGuard guard(nonReclaimableSection_);
+    memory::ReclaimableSectionGuard guard(nonReclaimableSection_);
     if (data_->pool()->maybeReserve(targetIncrementBytes)) {
       return;
     }
@@ -130,7 +132,7 @@ void SortWindowBuild::ensureInputFits(const RowVectorPtr& input) {
 
   LOG(WARNING) << "Failed to reserve " << succinctBytes(targetIncrementBytes)
                << " for memory pool " << data_->pool()->name()
-               << ", usage: " << succinctBytes(data_->pool()->currentBytes())
+               << ", usage: " << succinctBytes(data_->pool()->usedBytes())
                << ", reservation: "
                << succinctBytes(data_->pool()->reservedBytes());
 }
@@ -145,7 +147,8 @@ void SortWindowBuild::setupSpiller() {
       inputType_,
       spillCompareFlags_.size(),
       spillCompareFlags_,
-      spillConfig_);
+      spillConfig_,
+      spillStats_);
 }
 
 void SortWindowBuild::spill() {
@@ -158,11 +161,35 @@ void SortWindowBuild::spill() {
   data_->pool()->release();
 }
 
-void SortWindowBuild::computePartitionStartRows() {
-  partitionStartRows_.reserve(numRows_);
+// Use double front and back search algorithm to find next partition start row.
+// It is more efficient than linear or binary search.
+// This algorithm is described at
+// https://medium.com/@insomniocode/search-algorithm-double-front-and-back-20f5f28512e7
+vector_size_t SortWindowBuild::findNextPartitionStartRow(vector_size_t start) {
   auto partitionCompare = [&](const char* lhs, const char* rhs) -> bool {
     return compareRowsWithKeys(lhs, rhs, partitionKeyInfo_);
   };
+
+  auto left = start;
+  auto right = left + 1;
+  auto lastPosition = sortedRows_.size();
+  while (right < lastPosition) {
+    auto distance = 1;
+    for (; distance < lastPosition - left; distance *= 2) {
+      right = left + distance;
+      if (partitionCompare(sortedRows_[left], sortedRows_[right]) != 0) {
+        lastPosition = right;
+        break;
+      }
+    }
+    left += distance / 2;
+    right = left + 1;
+  }
+  return right;
+}
+
+void SortWindowBuild::computePartitionStartRows() {
+  partitionStartRows_.reserve(numRows_);
 
   // Using a sequential traversal to find changing partitions.
   // This algorithm is inefficient and can be changed
@@ -172,15 +199,13 @@ void SortWindowBuild::computePartitionStartRows() {
   partitionStartRows_.push_back(0);
 
   VELOX_CHECK_GT(sortedRows_.size(), 0);
-  for (auto i = 1; i < sortedRows_.size(); i++) {
-    if (partitionCompare(sortedRows_[i - 1], sortedRows_[i])) {
-      partitionStartRows_.push_back(i);
-    }
-  }
 
-  // Setting the startRow of the (last + 1) partition to be returningRows.size()
-  // to help for last partition related calculations.
-  partitionStartRows_.push_back(sortedRows_.size());
+  vector_size_t start = 0;
+  while (start < sortedRows_.size()) {
+    auto next = findNextPartitionStartRow(start);
+    partitionStartRows_.push_back(next);
+    start = next;
+  }
 }
 
 void SortWindowBuild::sortPartitions() {
@@ -213,8 +238,11 @@ void SortWindowBuild::noMoreInput() {
     spill();
 
     VELOX_CHECK_NULL(merge_);
-    auto spillPartition = spiller_->finishSpill();
-    merge_ = spillPartition.createOrderedReader(pool_);
+    SpillPartitionSet spillPartitionSet;
+    spiller_->finishSpill(spillPartitionSet);
+    VELOX_CHECK_EQ(spillPartitionSet.size(), 1);
+    merge_ = spillPartitionSet.begin()->second->createOrderedReader(
+        spillConfig_->readBufferSize, pool_, spillStats_);
   } else {
     // At this point we have seen all the input rows. The operator is
     // being prepared to output rows now.
@@ -266,12 +294,12 @@ void SortWindowBuild::loadNextPartitionFromSpill() {
   }
 }
 
-std::unique_ptr<WindowPartition> SortWindowBuild::nextPartition() {
+std::shared_ptr<WindowPartition> SortWindowBuild::nextPartition() {
   if (merge_ != nullptr) {
     VELOX_CHECK(!sortedRows_.empty(), "No window partitions available")
     auto partition = folly::Range(sortedRows_.data(), sortedRows_.size());
-    return std::make_unique<WindowPartition>(
-        data_.get(), partition, inputColumns_, sortKeyInfo_);
+    return std::make_shared<WindowPartition>(
+        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
   }
 
   VELOX_CHECK(!partitionStartRows_.empty(), "No window partitions available")
@@ -288,8 +316,8 @@ std::unique_ptr<WindowPartition> SortWindowBuild::nextPartition() {
   auto partition = folly::Range(
       sortedRows_.data() + partitionStartRows_[currentPartition_],
       partitionSize);
-  return std::make_unique<WindowPartition>(
-      data_.get(), partition, inputColumns_, sortKeyInfo_);
+  return std::make_shared<WindowPartition>(
+      data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
 }
 
 bool SortWindowBuild::hasNextPartition() {

@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include "folly/CPortability.h"
+
 #include "velox/expression/FunctionSignature.h"
 #include "velox/functions/lib/CheckedArithmeticImpl.h"
 #include "velox/functions/lib/aggregates/DecimalAggregate.h"
@@ -41,15 +43,6 @@ class SumAggregateBase
 
   int32_t accumulatorAlignmentSize() const override {
     return 1;
-  }
-
-  void initializeNewGroups(
-      char** groups,
-      folly::Range<const vector_size_t*> indices) override {
-    exec::Aggregate::setAllNulls(groups, indices);
-    for (auto i : indices) {
-      *exec::Aggregate::value<TAccumulator>(groups[i]) = 0;
-    }
   }
 
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
@@ -133,7 +126,7 @@ class SumAggregateBase
 
     if (mayPushdown && arg->isLazy()) {
       BaseAggregate::template pushdown<
-          facebook::velox::aggregate::SumHook<TValue, TData, Overflow>>(
+          facebook::velox::aggregate::SumHook<TData, Overflow>>(
           groups, rows, arg);
       return;
     }
@@ -147,22 +140,27 @@ class SumAggregateBase
     }
   }
 
- private:
-  /// Update functions that check for overflows for integer types.
-  /// For floating points, an overflow results in +/- infinity which is a
-  /// valid output.
-  template <typename TData>
-  static void updateSingleValue(TData& result, TData value) {
-    if constexpr (
-        (std::is_same_v<TData, int64_t> && Overflow) ||
-        std::is_same_v<TData, double> || std::is_same_v<TData, float>) {
-      result += value;
-    } else {
-      result = functions::checkedPlus<TData>(result, value);
+  void initializeNewGroupsInternal(
+      char** groups,
+      folly::Range<const vector_size_t*> indices) override {
+    exec::Aggregate::setAllNulls(groups, indices);
+    for (auto i : indices) {
+      *exec::Aggregate::value<TAccumulator>(groups[i]) = 0;
     }
   }
 
+ private:
   template <typename TData>
+  static void updateSingleValue(TData& result, TData value) {
+    velox::aggregate::SumHook<TData, Overflow>::add(result, value);
+  }
+
+  // Disable undefined behavior sanitizer to not fail on signed integer
+  // overflow.
+  template <typename TData>
+#if defined(FOLLY_DISABLE_UNDEFINED_BEHAVIOR_SANITIZER)
+  FOLLY_DISABLE_UNDEFINED_BEHAVIOR_SANITIZER("signed-integer-overflow")
+#endif
   static void updateDuplicateValues(TData& result, TData value, int n) {
     if constexpr (
         (std::is_same_v<TData, int64_t> && Overflow) ||

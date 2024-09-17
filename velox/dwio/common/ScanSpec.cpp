@@ -19,52 +19,31 @@
 
 namespace facebook::velox::common {
 
-ScanSpec& ScanSpec::operator=(const ScanSpec& other) {
-  if (this != &other) {
-    numReads_ = other.numReads_;
-    subscript_ = other.subscript_;
-    fieldName_ = other.fieldName_;
-    channel_ = other.channel_;
-    constantValue_ = other.constantValue_;
-    projectOut_ = other.projectOut_;
-    extractValues_ = other.extractValues_;
-    makeFlat_ = other.makeFlat_;
-    filter_ = other.filter_;
-    metadataFilters_ = other.metadataFilters_;
-    selectivity_ = other.selectivity_;
-    enableFilterReorder_ = other.enableFilterReorder_;
-    children_ = other.children_;
-    stableChildren_ = other.stableChildren_;
-    childByFieldName_ = other.childByFieldName_;
-    valueHook_ = other.valueHook_;
-    isArrayElementOrMapEntry_ = other.isArrayElementOrMapEntry_;
-    maxArrayElementsCount_ = other.maxArrayElementsCount_;
+ScanSpec* ScanSpec::getOrCreateChild(const std::string& name) {
+  if (auto it = this->childByFieldName_.find(name);
+      it != this->childByFieldName_.end()) {
+    return it->second;
   }
-  return *this;
+  this->children_.push_back(std::make_unique<ScanSpec>(name));
+  auto* child = this->children_.back().get();
+  this->childByFieldName_[child->fieldName()] = child;
+  return child;
 }
 
 ScanSpec* ScanSpec::getOrCreateChild(const Subfield& subfield) {
-  auto container = this;
-  auto& path = subfield.path();
+  auto* container = this;
+  const auto& path = subfield.path();
   for (size_t depth = 0; depth < path.size(); ++depth) {
-    auto element = path[depth].get();
+    const auto element = path[depth].get();
     VELOX_CHECK_EQ(element->kind(), kNestedField);
     auto* nestedField = static_cast<const Subfield::NestedField*>(element);
-    auto it = container->childByFieldName_.find(nestedField->name());
-    if (it != container->childByFieldName_.end()) {
-      container = it->second;
-    } else {
-      container->children_.push_back(std::make_unique<ScanSpec>(*element));
-      auto* child = container->children_.back().get();
-      container->childByFieldName_[child->fieldName()] = child;
-      container = child;
-    }
+    container = container->getOrCreateChild(nestedField->name());
   }
   return container;
 }
 
 uint64_t ScanSpec::newRead() {
-  if (!numReads_) {
+  if (numReads_ == 0) {
     reorder();
   } else if (enableFilterReorder_) {
     for (auto i = 1; i < children_.size(); ++i) {
@@ -78,13 +57,14 @@ uint64_t ScanSpec::newRead() {
       }
     }
   }
-  return numReads_++;
+  return ++numReads_;
 }
 
 void ScanSpec::reorder() {
   if (children_.empty()) {
     return;
   }
+
   // Make sure 'stableChildren_' is initialized.
   stableChildren();
   std::sort(
@@ -153,36 +133,34 @@ bool ScanSpec::hasFilter() const {
   return false;
 }
 
+bool ScanSpec::testNull() const {
+  if (filter_ && !filter_->testNull()) {
+    return false;
+  }
+  for (auto& child : children_) {
+    if (!child->isArrayElementOrMapEntry_ && !child->testNull()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void ScanSpec::moveAdaptationFrom(ScanSpec& other) {
   // moves the filters and filter order from 'other'.
-  std::vector<std::shared_ptr<ScanSpec>> newChildren;
-  childByFieldName_.clear();
-  for (auto& otherChild : other.children_) {
-    bool found = false;
-    for (auto& child : children_) {
-      if (child && child->fieldName_ == otherChild->fieldName_) {
-        if (!child->isConstant() && !otherChild->isConstant()) {
-          // If other child is constant, a possible filter on a
-          // constant will have been evaluated at split start time. If
-          // 'child' is constant there is no adaptation that can be
-          // received.
-          child->filter_ = std::move(otherChild->filter_);
-          child->selectivity_ = otherChild->selectivity_;
-        }
-        childByFieldName_[child->fieldName_] = child.get();
-        newChildren.push_back(std::move(child));
-        found = true;
-        break;
-      }
+  for (auto& child : children_) {
+    auto it = other.childByFieldName_.find(child->fieldName_);
+    if (it == other.childByFieldName_.end()) {
+      continue;
     }
-    VELOX_CHECK(found);
-  }
-  children_ = std::move(newChildren);
-  stableChildren_.clear();
-  for (auto& otherChild : other.stableChildren_) {
-    auto child = childByName(otherChild->fieldName_);
-    VELOX_CHECK(child);
-    stableChildren_.push_back(child);
+    auto* otherChild = it->second;
+    if (!child->isConstant() && !otherChild->isConstant()) {
+      // If other child is constant, a possible filter on a
+      // constant will have been evaluated at split start time. If
+      // 'child' is constant there is no adaptation that can be
+      // received.
+      child->filter_ = std::move(otherChild->filter_);
+      child->selectivity_ = otherChild->selectivity_;
+    }
   }
 }
 
@@ -290,8 +268,8 @@ bool testStringFilter(
 bool testBoolFilter(
     common::Filter* filter,
     dwio::common::BooleanColumnStatistics* boolStats) {
-  auto trueCount = boolStats->getTrueCount();
-  auto falseCount = boolStats->getFalseCount();
+  const auto trueCount = boolStats->getTrueCount();
+  const auto falseCount = boolStats->getFalseCount();
   if (trueCount.has_value() && falseCount.has_value()) {
     if (trueCount.value() == 0) {
       if (!filter->testBool(false)) {
@@ -313,7 +291,7 @@ bool testFilter(
     dwio::common::ColumnStatistics* stats,
     uint64_t totalRows,
     const TypePtr& type) {
-  bool mayHaveNull = true;
+  bool mayHaveNull{true};
 
   // Has-null statistics is often not set. Hence, we supplement it with
   // number-of-values statistic to detect no-null columns more often.
@@ -331,6 +309,7 @@ bool testFilter(
     // IS NULL filter cannot pass.
     return false;
   }
+
   if (mayHaveNull && filter->testNull()) {
     return true;
   }
@@ -342,23 +321,23 @@ bool testFilter(
     case TypeKind::INTEGER:
     case TypeKind::SMALLINT:
     case TypeKind::TINYINT: {
-      auto intStats =
+      auto* intStats =
           dynamic_cast<dwio::common::IntegerColumnStatistics*>(stats);
       return testIntFilter(filter, intStats, mayHaveNull);
     }
     case TypeKind::REAL:
     case TypeKind::DOUBLE: {
-      auto doubleStats =
+      auto* doubleStats =
           dynamic_cast<dwio::common::DoubleColumnStatistics*>(stats);
       return testDoubleFilter(filter, doubleStats, mayHaveNull);
     }
     case TypeKind::BOOLEAN: {
-      auto boolStats =
+      auto* boolStats =
           dynamic_cast<dwio::common::BooleanColumnStatistics*>(stats);
       return testBoolFilter(filter, boolStats);
     }
     case TypeKind::VARCHAR: {
-      auto stringStats =
+      auto* stringStats =
           dynamic_cast<dwio::common::StringColumnStatistics*>(stats);
       return testStringFilter(filter, stringStats, mayHaveNull);
     }
@@ -402,24 +381,12 @@ std::string ScanSpec::toString() const {
   return out.str();
 }
 
-std::shared_ptr<ScanSpec> ScanSpec::removeChild(const ScanSpec* child) {
-  for (auto it = children_.begin(); it != children_.end(); ++it) {
-    if (it->get() == child) {
-      auto removed = std::move(*it);
-      children_.erase(it);
-      childByFieldName_.erase(removed->fieldName());
-      return removed;
-    }
-  }
-  return nullptr;
-}
-
 void ScanSpec::addFilter(const Filter& filter) {
   filter_ = filter_ ? filter_->mergeWith(&filter) : filter.clone();
 }
 
 ScanSpec* ScanSpec::addField(const std::string& name, column_index_t channel) {
-  auto child = getOrCreateChild(Subfield(name));
+  auto child = getOrCreateChild(name);
   child->setProjectOut(true);
   child->setChannel(channel);
   return child;

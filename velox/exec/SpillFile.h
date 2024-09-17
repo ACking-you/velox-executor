@@ -22,6 +22,7 @@
 #include "velox/common/base/SpillStats.h"
 #include "velox/common/compression/Compression.h"
 #include "velox/common/file/File.h"
+#include "velox/common/file/FileInputStream.h"
 #include "velox/common/file/FileSystems.h"
 #include "velox/exec/TreeOfLosers.h"
 #include "velox/exec/UnorderedStreamReader.h"
@@ -135,6 +136,9 @@ class SpillWriter {
   /// start a new one.
   void finishFile();
 
+  /// Returns the number of current finished files.
+  size_t numFinishedFiles() const;
+
   /// Finishes this file writer and returns the written spill files info.
   ///
   /// NOTE: we don't allow write to a spill writer after t
@@ -196,37 +200,6 @@ class SpillWriter {
   SpillFiles finishedFiles_;
 };
 
-/// Input stream backed by spill file.
-///
-/// TODO Usage of ByteInputStream as base class is hacky and just happens to
-/// work. For example, ByteInputStream::size(), seekp(), tellp(),
-/// remainingSize() APIs do not work properly.
-class SpillInputStream : public ByteInputStream {
- public:
-  /// Reads from 'input' using 'buffer' for buffering reads.
-  SpillInputStream(std::unique_ptr<ReadFile>&& file, BufferPtr buffer)
-      : file_(std::move(file)),
-        size_(file_->size()),
-        buffer_(std::move(buffer)) {
-    next(true);
-  }
-
-  /// True if all of the file has been read into vectors.
-  bool atEnd() const override {
-    return offset_ >= size_ && ranges()[0].position >= ranges()[0].size;
-  }
-
- private:
-  void next(bool throwIfPastEnd) override;
-
-  const std::unique_ptr<ReadFile> file_;
-  const uint64_t size_;
-  const BufferPtr buffer_;
-
-  // Offset of first byte not in 'buffer_'
-  uint64_t offset_ = 0;
-};
-
 /// Represents a spill file for read which turns the serialized spilled data on
 /// disk back into a sequence of spilled row vectors.
 ///
@@ -238,7 +211,9 @@ class SpillReadFile {
  public:
   static std::unique_ptr<SpillReadFile> create(
       const SpillFileInfo& fileInfo,
-      memory::MemoryPool* pool);
+      uint64_t bufferSize,
+      memory::MemoryPool* pool,
+      folly::Synchronized<common::SpillStats>* stats);
 
   uint32_t id() const {
     return id_;
@@ -268,11 +243,18 @@ class SpillReadFile {
       uint32_t id,
       const std::string& path,
       uint64_t size,
+      uint64_t bufferSize,
       const RowTypePtr& type,
       uint32_t numSortKeys,
       const std::vector<CompareFlags>& sortCompareFlags,
       common::CompressionKind compressionKind,
-      memory::MemoryPool* pool);
+      memory::MemoryPool* pool,
+      folly::Synchronized<common::SpillStats>* stats);
+
+#ifndef VELOX_ENABLE_BACKWARD_COMPATIBILITY
+  // Invoked to record spill read stats at the end of read input.
+  void recordSpillStats();
+#endif
 
   // The spill file id which is monotonically increasing and unique for each
   // associated spill partition.
@@ -287,7 +269,8 @@ class SpillReadFile {
   const common::CompressionKind compressionKind_;
   const serializer::presto::PrestoVectorSerde::PrestoOptions readOptions_;
   memory::MemoryPool* const pool_;
+  folly::Synchronized<common::SpillStats>* const stats_;
 
-  std::unique_ptr<SpillInputStream> input_;
+  std::unique_ptr<common::FileInputStream> input_;
 };
 } // namespace facebook::velox::exec

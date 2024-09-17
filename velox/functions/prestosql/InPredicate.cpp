@@ -20,64 +20,12 @@
 namespace facebook::velox::functions {
 namespace {
 
-class GenericInPredicate : public exec::VectorFunction {
- public:
-  bool isDefaultNullBehavior() const override {
-    return false;
-  }
-
-  void apply(
-      const SelectivityVector& rows,
-      std::vector<VectorPtr>& args,
-      const TypePtr& /* outputType */,
-      exec::EvalCtx& context,
-      VectorPtr& result) const override {
-    exec::DecodedArgs decodedArgs(rows, args, context);
-    auto* value = decodedArgs.at(0);
-    auto* valueBase = value->base();
-
-    context.ensureWritable(rows, BOOLEAN(), result);
-    result->clearNulls(rows);
-    auto* boolResult = result->asUnchecked<FlatVector<bool>>();
-
-    context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
-      if (value->isNullAt(row)) {
-        boolResult->setNull(row, true);
-        return;
-      }
-
-      const auto valueBaseRow = value->index(row);
-      if (valueBase->containsNullAt(valueBaseRow)) {
-        boolResult->setNull(row, true);
-        return;
-      }
-
-      bool hasNull = false;
-      for (auto i = 1; i < args.size(); ++i) {
-        const auto baseRow = decodedArgs.at(i)->index(row);
-        if (decodedArgs.at(i)->isNullAt(row) ||
-            decodedArgs.at(i)->base()->containsNullAt(baseRow)) {
-          hasNull = true;
-        } else if (decodedArgs.at(i)->base()->equalValueAt(
-                       valueBase, baseRow, valueBaseRow)) {
-          boolResult->set(row, true);
-          return;
-        }
-      }
-
-      if (hasNull) {
-        boolResult->setNull(row, true);
-      } else {
-        boolResult->set(row, false);
-      }
-    });
-  }
-};
-
 // Returns NULL if
-// - input value is NULL or contains NULL;
-// - input value doesn't match any of the in-list values, but some of in-list
-// values are NULL or contain NULL.
+// - input value is NULL
+// - in-list is NULL or empty
+// - input value doesn't have an exact match, but has an indeterminate match in
+// the in-list. E.g., 'array[null] in (array[1])' or 'array[1] in
+// (array[null])'.
 class ComplexTypeInPredicate : public exec::VectorFunction {
  public:
   struct ComplexValue {
@@ -116,9 +64,8 @@ class ComplexTypeInPredicate : public exec::VectorFunction {
     for (auto i = offset; i < offset + size; i++) {
       if (values->containsNullAt(i)) {
         hasNull = true;
-      } else {
-        uniqueValues.insert({values.get(), i});
       }
+      uniqueValues.insert({values.get(), i});
     }
 
     return std::make_shared<ComplexTypeInPredicate>(
@@ -138,20 +85,45 @@ class ComplexTypeInPredicate : public exec::VectorFunction {
     auto* boolResult = result->asUnchecked<FlatVector<bool>>();
 
     rows.applyToSelected([&](vector_size_t row) {
-      if (arg->containsNullAt(row)) {
+      if (arg->isNullAt(row)) {
         boolResult->setNull(row, true);
       } else {
         const bool found = uniqueValues_.contains({arg.get(), row});
-        if (!found && hasNull_) {
-          boolResult->setNull(row, true);
+        if (found) {
+          if (arg->containsNullAt(row)) {
+            boolResult->setNull(row, true);
+          } else {
+            boolResult->set(row, true);
+          }
         } else {
-          boolResult->set(row, found);
+          if ((arg->containsNullAt(row) || hasNull_) &&
+              hasIndeterminateMatch(arg, row)) {
+            boolResult->setNull(row, true);
+          } else {
+            boolResult->set(row, false);
+          }
         }
       }
     });
   }
 
  private:
+  bool hasIndeterminateMatch(const VectorPtr& vector, vector_size_t index)
+      const {
+    for (const auto& value : uniqueValues_) {
+      if (!vector
+               ->equalValueAt(
+                   value.vector,
+                   index,
+                   value.index,
+                   CompareFlags::NullHandlingMode::kNullAsIndeterminate)
+               .has_value()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Set of unique values to check against. This set doesn't include any value
   // that is null or contains null.
   const ComplexSet uniqueValues_;
@@ -245,16 +217,15 @@ createFloatingPointValuesFilter(
   VELOX_USER_CHECK(
       !values.empty(),
       "IN predicate expects at least one non-null value in the in-list");
-
-  if (values.size() == 1) {
-    return {
-        std::make_unique<common::FloatingPointRange<T>>(
-            values[0], false, false, values[0], false, false, nullAllowed),
-        false};
-  }
-
+  // Avoid using FloatingPointRange for optimization of a single value in-list
+  // as it does not support NaN as a bound for specifying a range.
   std::vector<int64_t> intValues(values.size());
   for (size_t i = 0; i < values.size(); ++i) {
+    if (std::isnan(values[i])) {
+      // We de-normalize NaN values to ensure different binary representations
+      // are treated the same.
+      values[i] = std::numeric_limits<T>::quiet_NaN();
+    }
     if constexpr (std::is_same_v<T, float>) {
       if (values[i] == float{}) {
         values[i] = 0;
@@ -325,6 +296,8 @@ std::pair<std::unique_ptr<common::Filter>, bool> createBytesValuesFilter(
   return {std::make_unique<common::BytesValues>(values, nullAllowed), false};
 }
 
+/// x IN (2, null) returns null when x != 2 and true when x == 2.
+/// Null for x always produces null, regardless of 'IN' list.
 class InPredicate : public exec::VectorFunction {
  public:
   explicit InPredicate(std::unique_ptr<common::Filter> filter, bool alwaysNull)
@@ -334,15 +307,10 @@ class InPredicate : public exec::VectorFunction {
       const std::string& /*name*/,
       const std::vector<exec::VectorFunctionArg>& inputArgs,
       const core::QueryConfig& /*config*/) {
-    VELOX_CHECK_GE(inputArgs.size(), 2);
+    VELOX_CHECK_EQ(inputArgs.size(), 2);
     auto inListType = inputArgs[1].type;
 
-    if (inListType->equivalent(*inputArgs[0].type)) {
-      return std::make_shared<GenericInPredicate>();
-    }
-
     VELOX_CHECK_EQ(inListType->kind(), TypeKind::ARRAY);
-    VELOX_CHECK_EQ(2, inputArgs.size());
 
     const auto& values = inputArgs[1].constantValue;
     VELOX_USER_CHECK_NOT_NULL(
@@ -426,12 +394,6 @@ class InPredicate : public exec::VectorFunction {
         std::move(filter.first), filter.second);
   }
 
-  // x IN (2, null) returns null when x != 2 and true when x == 2.
-  // Null for x always produces null, regardless of 'IN' list.
-  bool isDefaultNullBehavior() const override {
-    return true;
-  }
-
   void apply(
       const SelectivityVector& rows,
       std::vector<VectorPtr>& args,
@@ -473,26 +435,26 @@ class InPredicate : public exec::VectorFunction {
         break;
       case TypeKind::REAL:
         applyTyped<float>(rows, input, context, result, [&](float value) {
-          auto* derived =
-              dynamic_cast<common::FloatingPointRange<float>*>(filter_.get());
-          if (derived) {
-            return filter_->testFloat(value);
-          }
           if (value == float{}) {
             value = 0;
+          } else if (std::isnan(value)) {
+            // We de-normalize NaN values to ensure different binary
+            // representations
+            // are treated the same.
+            value = std::numeric_limits<float>::quiet_NaN();
           }
           return filter_->testInt64(reinterpret_cast<const int32_t&>(value));
         });
         break;
       case TypeKind::DOUBLE:
         applyTyped<double>(rows, input, context, result, [&](double value) {
-          auto* derived =
-              dynamic_cast<common::FloatingPointRange<double>*>(filter_.get());
-          if (derived) {
-            return filter_->testDouble(value);
-          }
           if (value == double{}) {
             value = 0;
+          } else if (std::isnan(value)) {
+            // We de-normalize NaN values to ensure different binary
+            // representations
+            // are treated the same.
+            value = std::numeric_limits<double>::quiet_NaN();
           }
           return filter_->testInt64(reinterpret_cast<const int64_t&>(value));
         });
@@ -536,14 +498,6 @@ class InPredicate : public exec::VectorFunction {
             .returnType("boolean")
             .argumentType("T")
             .constantArgumentType("array(unknown)")
-            .build(),
-        // (T, T,...) -> boolean for non-constant IN lists.
-        exec::FunctionSignatureBuilder()
-            .typeVariable("T")
-            .returnType("boolean")
-            .argumentType("T")
-            .argumentType("T")
-            .variableArity()
             .build(),
     };
   }
@@ -631,4 +585,5 @@ VELOX_DECLARE_STATEFUL_VECTOR_FUNCTION(
     udf_in,
     InPredicate::signatures(),
     InPredicate::create);
+
 } // namespace facebook::velox::functions

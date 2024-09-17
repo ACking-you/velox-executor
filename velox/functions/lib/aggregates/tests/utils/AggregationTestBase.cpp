@@ -24,8 +24,10 @@
 #include "velox/dwio/dwrf/writer/Writer.h"
 #include "velox/exec/AggregateCompanionSignatures.h"
 #include "velox/exec/PlanNodeStats.h"
+#include "velox/exec/Spill.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 #include "velox/exec/tests/utils/TempFilePath.h"
+#include "velox/expression/Expr.h"
 #include "velox/expression/SignatureBinder.h"
 
 using facebook::velox::exec::Spiller;
@@ -40,10 +42,10 @@ namespace {
 constexpr const char* kHiveConnectorId = "test-hive";
 
 void enableAbandonPartialAggregation(AssertQueryBuilder& queryBuilder) {
-  queryBuilder.config(core::QueryConfig::kAbandonPartialAggregationMinRows, "1")
-      .config(core::QueryConfig::kAbandonPartialAggregationMinPct, "0")
-      .config(core::QueryConfig::kMaxPartialAggregationMemory, "0")
-      .config(core::QueryConfig::kMaxExtendedPartialAggregationMemory, "0")
+  queryBuilder.config(core::QueryConfig::kAbandonPartialAggregationMinRows, 1)
+      .config(core::QueryConfig::kAbandonPartialAggregationMinPct, 0)
+      .config(core::QueryConfig::kMaxPartialAggregationMemory, 0)
+      .config(core::QueryConfig::kMaxExtendedPartialAggregationMemory, 0)
       .maxDrivers(1);
 }
 
@@ -68,7 +70,10 @@ void AggregationTestBase::SetUp() {
   auto hiveConnector =
       connector::getConnectorFactory(
           connector::hive::HiveConnectorFactory::kHiveConnectorName)
-          ->newConnector(kHiveConnectorId, std::make_shared<core::MemConfig>());
+          ->newConnector(
+              kHiveConnectorId,
+              std::make_shared<config::ConfigBase>(
+                  std::unordered_map<std::string, std::string>()));
   connector::registerConnector(hiveConnector);
 }
 
@@ -82,11 +87,9 @@ void AggregationTestBase::testAggregations(
     const std::vector<std::string>& groupingKeys,
     const std::vector<std::string>& aggregates,
     const std::string& duckDbSql,
-    const std::unordered_map<std::string, std::string>& config,
-    bool testWithTableScan) {
+    const std::unordered_map<std::string, std::string>& config) {
   SCOPED_TRACE(duckDbSql);
-  testAggregations(
-      data, groupingKeys, aggregates, {}, duckDbSql, config, testWithTableScan);
+  testAggregations(data, groupingKeys, aggregates, {}, duckDbSql, config);
 }
 
 void AggregationTestBase::testAggregations(
@@ -94,16 +97,8 @@ void AggregationTestBase::testAggregations(
     const std::vector<std::string>& groupingKeys,
     const std::vector<std::string>& aggregates,
     const std::vector<RowVectorPtr>& expectedResult,
-    const std::unordered_map<std::string, std::string>& config,
-    bool testWithTableScan) {
-  testAggregations(
-      data,
-      groupingKeys,
-      aggregates,
-      {},
-      expectedResult,
-      config,
-      testWithTableScan);
+    const std::unordered_map<std::string, std::string>& config) {
+  testAggregations(data, groupingKeys, aggregates, {}, expectedResult, config);
 }
 
 void AggregationTestBase::testAggregations(
@@ -112,8 +107,7 @@ void AggregationTestBase::testAggregations(
     const std::vector<std::string>& aggregates,
     const std::vector<std::string>& postAggregationProjections,
     const std::string& duckDbSql,
-    const std::unordered_map<std::string, std::string>& config,
-    bool testWithTableScan) {
+    const std::unordered_map<std::string, std::string>& config) {
   SCOPED_TRACE(duckDbSql);
   testAggregations(
       [&](PlanBuilder& builder) { builder.values(data); },
@@ -121,8 +115,7 @@ void AggregationTestBase::testAggregations(
       aggregates,
       postAggregationProjections,
       [&](auto& builder) { return builder.assertResults(duckDbSql); },
-      config,
-      testWithTableScan);
+      config);
 }
 
 namespace {
@@ -135,8 +128,43 @@ int64_t spilledBytes(const exec::Task& task) {
       spilledBytes += op.spilledBytes;
     }
   }
-
   return spilledBytes;
+}
+
+// Returns total spilled rows inside 'task'.
+int64_t spilledRows(const exec::Task& task) {
+  auto stats = task.taskStats();
+  int64_t spilledRows = 0;
+  for (auto& pipeline : stats.pipelineStats) {
+    for (auto op : pipeline.operatorStats) {
+      spilledRows += op.spilledRows;
+    }
+  }
+  return spilledRows;
+}
+
+// Returns total spilled input bytes inside 'task'.
+int64_t spilledInputBytes(const exec::Task& task) {
+  auto stats = task.taskStats();
+  int64_t spilledInputBytes = 0;
+  for (auto& pipeline : stats.pipelineStats) {
+    for (auto op : pipeline.operatorStats) {
+      spilledInputBytes += op.spilledInputBytes;
+    }
+  }
+  return spilledInputBytes;
+}
+
+// Returns total spilled files inside 'task'.
+int64_t spilledFiles(const exec::Task& task) {
+  auto stats = task.taskStats();
+  int64_t spilledFiles = 0;
+  for (auto& pipeline : stats.pipelineStats) {
+    for (auto op : pipeline.operatorStats) {
+      spilledFiles += op.spilledFiles;
+    }
+  }
+  return spilledFiles;
 }
 
 // Add a BIGINT column of 4 distinct values to data.
@@ -247,6 +275,55 @@ getFunctionNamesAndArgs(const std::vector<std::string>& aggregates) {
   }
   return std::make_pair(functionNames, aggregateArgs);
 }
+
+// Given a list of aggregation expressions, e.g., {"avg(c0)",
+// "\"$internal$count_distinct\"(c1)"}, fetch the function names from
+// AggregationNode of builder.planNode().
+std::vector<std::string> getFunctionNames(
+    std::function<void(exec::test::PlanBuilder&)> makeSource,
+    const std::vector<std::string>& aggregates,
+    memory::MemoryPool* pool) {
+  std::vector<std::string> functionNames;
+
+  PlanBuilder builder(pool);
+  makeSource(builder);
+
+  builder.singleAggregation({}, aggregates);
+  auto& aggregationNode =
+      static_cast<const core::AggregationNode&>(*builder.planNode());
+
+  for (const auto& aggregate : aggregationNode.aggregates()) {
+    const auto& aggregateExpr = aggregate.call;
+    const auto& name = aggregateExpr->name();
+
+    functionNames.push_back(name);
+  }
+
+  return functionNames;
+}
+
+// Given a list of aggregation expressions, check if any of aggregate functions
+// are order sensitive with metadata.
+bool hasOrderSensitive(
+    std::function<void(exec::test::PlanBuilder&)> makeSource,
+    const std::vector<std::string>& aggregates,
+    memory::MemoryPool* pool) {
+  auto functionNames = getFunctionNames(makeSource, aggregates, pool);
+  return std::any_of(
+      functionNames.begin(), functionNames.end(), [](const auto& functionName) {
+        auto* entry = exec::getAggregateFunctionEntry(functionName);
+        const auto& metadata = entry->metadata;
+        return metadata.orderSensitive;
+      });
+}
+// Same as above, but allows to specify input data instead of a function.
+bool hasOrderSensitive(
+    const std::vector<RowVectorPtr>& data,
+    const std::vector<std::string>& aggregates,
+    memory::MemoryPool* pool) {
+  return hasOrderSensitive(
+      [&](PlanBuilder& builder) { builder.values(data); }, aggregates, pool);
+}
 } // namespace
 
 void AggregationTestBase::testAggregationsWithCompanion(
@@ -347,7 +424,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     assertResults(queryBuilder);
   }
 
-  if (!groupingKeys.empty() && allowInputShuffle_) {
+  if (!groupingKeys.empty() && !hasOrderSensitive(data, aggregates, pool())) {
     SCOPED_TRACE("Run partial + final with spilling");
     PlanBuilder builder(pool());
     builder.values(dataWithExtraGroupingKey);
@@ -356,6 +433,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
     // Spilling needs at least 2 batches of input. Use round-robin
     // repartitioning to split input into multiple batches.
     core::PlanNodeId partialNodeId;
+    core::PlanNodeId finalNodeId;
     builder.localPartitionRoundRobinRow()
         .partialAggregation(groupingKeysWithPartialKey, paritialAggregates)
         .capturePlanNodeId(partialNodeId)
@@ -365,6 +443,7 @@ void AggregationTestBase::testAggregationsWithCompanion(
         .capturePlanNodeId(partialNodeId)
         .localPartition(groupingKeys)
         .finalAggregation()
+        .capturePlanNodeId(finalNodeId)
         .project(extractExpressions);
 
     if (!postAggregationProjections.empty()) {
@@ -375,20 +454,35 @@ void AggregationTestBase::testAggregationsWithCompanion(
 
     AssertQueryBuilder queryBuilder(builder.planNode(), duckDbQueryRunner_);
     queryBuilder.configs(config)
-        .config(core::QueryConfig::kTestingSpillPct, "100")
-        .config(core::QueryConfig::kSpillEnabled, "true")
-        .config(core::QueryConfig::kAggregationSpillEnabled, "true")
-        .spillDirectory(spillDirectory->path)
+        .config(core::QueryConfig::kSpillEnabled, true)
+        .config(core::QueryConfig::kAggregationSpillEnabled, true)
+        .spillDirectory(spillDirectory->getPath())
         .maxDrivers(4);
 
+    exec::TestScopedSpillInjection scopedSpillInjection(100);
     auto task = assertResults(queryBuilder);
 
     // Expect > 0 spilled bytes unless there was no input.
-    auto inputRows = toPlanStats(task->taskStats()).at(partialNodeId).inputRows;
-    if (inputRows > 1) {
-      EXPECT_LT(0, spilledBytes(*task));
+    const auto partialInputRows =
+        toPlanStats(task->taskStats()).at(partialNodeId).inputRows;
+    const auto finalInputRows =
+        toPlanStats(task->taskStats()).at(finalNodeId).inputRows;
+    if (exec::injectedSpillCount() > 0) {
+      EXPECT_LT(0, spilledBytes(*task))
+          << "partial inputRows: " << partialInputRows
+          << " final inputRows: " << finalInputRows
+          << " spilledRows: " << spilledRows(*task)
+          << " spilledInputBytes: " << spilledInputBytes(*task)
+          << " spilledFiles: " << spilledFiles(*task)
+          << " injectedSpills: " << exec::injectedSpillCount();
     } else {
-      EXPECT_EQ(0, spilledBytes(*task));
+      EXPECT_EQ(0, spilledBytes(*task))
+          << "partial inputRows: " << partialInputRows
+          << " final inputRows: " << finalInputRows
+          << " spilledRows: " << spilledRows(*task)
+          << " spilledInputBytes: " << spilledInputBytes(*task)
+          << " spilledFiles: " << spilledFiles(*task)
+          << " injectedSpills: " << exec::injectedSpillCount();
     }
   }
 
@@ -538,6 +632,30 @@ class ScopedChange {
   T* value_;
 };
 
+bool isTableScanSupported(const TypePtr& type) {
+  if (type->kind() == TypeKind::ROW && type->size() == 0) {
+    return false;
+  }
+  if (type->kind() == TypeKind::UNKNOWN) {
+    return false;
+  }
+  if (type->kind() == TypeKind::HUGEINT) {
+    return false;
+  }
+  // Disable testing with TableScan when input contains TIMESTAMP type, due to
+  // the issue #8127.
+  if (type->kind() == TypeKind::TIMESTAMP) {
+    return false;
+  }
+
+  for (auto i = 0; i < type->size(); ++i) {
+    if (!isTableScanSupported(type->childAt(i))) {
+      return false;
+    }
+  }
+
+  return true;
+}
 } // namespace
 
 void AggregationTestBase::testReadFromFiles(
@@ -550,23 +668,41 @@ void AggregationTestBase::testReadFromFiles(
     const std::unordered_map<std::string, std::string>& config) {
   PlanBuilder builder(pool());
   makeSource(builder);
-  auto input = AssertQueryBuilder(builder.planNode()).copyResults(pool());
-  if (input->size() < 2) {
+
+  if (!isTableScanSupported(builder.planNode()->outputType())) {
     return;
   }
-  auto size1 = input->size() / 2;
-  auto size2 = input->size() - size1;
-  auto input1 = input->slice(0, size1);
-  auto input2 = input->slice(size1, size2);
+
+  auto input = AssertQueryBuilder(builder.planNode()).copyResults(pool());
+  if (input->size() == 0) {
+    return;
+  }
+
   std::vector<std::shared_ptr<exec::test::TempFilePath>> files;
   std::vector<exec::Split> splits;
+  std::vector<VectorPtr> inputs;
   auto writerPool = rootPool_->addAggregateChild("AggregationTestBase.writer");
-  for (auto& vector : {input1, input2}) {
+
+  // Splits and writes the input vectors into two files, to some extent,
+  // involves shuffling of the inputs. So only split input if aggregate
+  // is non-orderSensitive. Otherwise, only write into a single file.
+  if (!hasOrderSensitive(makeSource, aggregates, pool()) &&
+      input->size() >= 2) {
+    auto size1 = input->size() / 2;
+    auto size2 = input->size() - size1;
+    auto input1 = input->slice(0, size1);
+    auto input2 = input->slice(size1, size2);
+    inputs = {input1, input2};
+  } else {
+    inputs.push_back(input);
+  }
+
+  for (auto& vector : inputs) {
     auto file = exec::test::TempFilePath::create();
-    writeToFile(file->path, vector, writerPool.get());
+    writeToFile(file->getPath(), vector, writerPool.get());
     files.push_back(file);
     splits.emplace_back(std::make_shared<connector::hive::HiveConnectorSplit>(
-        kHiveConnectorId, file->path, dwio::common::FileFormat::DWRF));
+        kHiveConnectorId, file->getPath(), dwio::common::FileFormat::DWRF));
   }
   // No need to test streaming as the streaming test generates its own inputs,
   // so it would be the same as the original test.
@@ -582,7 +718,7 @@ void AggregationTestBase::testReadFromFiles(
   }
 
   for (const auto& file : files) {
-    remove(file->path.c_str());
+    remove(file->getPath().c_str());
   }
 }
 
@@ -592,16 +728,14 @@ void AggregationTestBase::testAggregations(
     const std::vector<std::string>& aggregates,
     const std::vector<std::string>& postAggregationProjections,
     const std::vector<RowVectorPtr>& expectedResult,
-    const std::unordered_map<std::string, std::string>& config,
-    bool testWithTableScan) {
+    const std::unordered_map<std::string, std::string>& config) {
   testAggregations(
       [&](PlanBuilder& builder) { builder.values(data); },
       groupingKeys,
       aggregates,
       postAggregationProjections,
       [&](auto& builder) { return builder.assertResults(expectedResult); },
-      config,
-      testWithTableScan);
+      config);
 }
 
 void AggregationTestBase::testAggregations(
@@ -609,17 +743,44 @@ void AggregationTestBase::testAggregations(
     const std::vector<std::string>& groupingKeys,
     const std::vector<std::string>& aggregates,
     const std::string& duckDbSql,
-    const std::unordered_map<std::string, std::string>& config,
-    bool testWithTableScan) {
+    const std::unordered_map<std::string, std::string>& config) {
   testAggregations(
       makeSource,
       groupingKeys,
       aggregates,
       {},
       [&](auto& builder) { return builder.assertResults(duckDbSql); },
-      config,
-      testWithTableScan);
+      config);
 }
+
+namespace {
+
+std::vector<VectorPtr> extractArgColumns(
+    const core::CallTypedExprPtr& aggregateExpr,
+    const RowVectorPtr& input,
+    memory::MemoryPool* pool) {
+  auto& type = input->type()->asRow();
+  std::vector<VectorPtr> columns;
+  for (const auto& arg : aggregateExpr->inputs()) {
+    if (auto field = core::TypedExprs::asFieldAccess(arg)) {
+      columns.push_back(input->childAt(field->name()));
+    }
+    if (core::TypedExprs::isConstant(arg)) {
+      auto constant = core::TypedExprs::asConstant(arg);
+      columns.push_back(constant->toConstantVector(pool));
+    }
+    if (auto lambda = core::TypedExprs::asLambda(arg)) {
+      for (const auto& name : lambda->signature()->names()) {
+        if (auto captureIndex = type.getChildIdxIfExists(name)) {
+          columns.push_back(input->childAt(captureIndex.value()));
+        }
+      }
+    }
+  }
+  return columns;
+}
+
+} // namespace
 
 RowVectorPtr AggregationTestBase::validateStreamingInTestAggregations(
     const std::function<void(PlanBuilder&)>& makeSource,
@@ -705,7 +866,8 @@ void AggregationTestBase::testAggregationsImpl(
     assertResults(queryBuilder);
   }
 
-  if (!groupingKeys.empty() && allowInputShuffle_) {
+  if (!groupingKeys.empty() &&
+      !hasOrderSensitive(makeSource, aggregates, pool())) {
     SCOPED_TRACE("Run partial + final with spilling");
     PlanBuilder builder(pool());
     makeSource(builder);
@@ -713,11 +875,13 @@ void AggregationTestBase::testAggregationsImpl(
     // Spilling needs at least 2 batches of input. Use round-robin
     // repartitioning to split input into multiple batches.
     core::PlanNodeId partialNodeId;
+    core::PlanNodeId finalNodeId;
     builder.localPartitionRoundRobinRow()
         .partialAggregation(groupingKeys, aggregates)
         .capturePlanNodeId(partialNodeId)
         .localPartition(groupingKeys)
-        .finalAggregation();
+        .finalAggregation()
+        .capturePlanNodeId(finalNodeId);
 
     if (!postAggregationProjections.empty()) {
       builder.project(postAggregationProjections);
@@ -725,29 +889,44 @@ void AggregationTestBase::testAggregationsImpl(
 
     auto spillDirectory = exec::test::TempDirectoryPath::create();
 
-    ASSERT_EQ(memory::spillMemoryPool()->stats().currentBytes, 0);
+    ASSERT_EQ(memory::spillMemoryPool()->stats().usedBytes, 0);
     const auto peakSpillMemoryUsage =
         memory::spillMemoryPool()->stats().peakBytes;
     AssertQueryBuilder queryBuilder(builder.planNode(), duckDbQueryRunner_);
     queryBuilder.configs(config)
-        .config(core::QueryConfig::kTestingSpillPct, "100")
-        .config(core::QueryConfig::kSpillEnabled, "true")
-        .config(core::QueryConfig::kAggregationSpillEnabled, "true")
-        .spillDirectory(spillDirectory->path)
+        .config(core::QueryConfig::kSpillEnabled, true)
+        .config(core::QueryConfig::kAggregationSpillEnabled, true)
+        .spillDirectory(spillDirectory->getPath())
         .maxDrivers(4);
 
+    exec::TestScopedSpillInjection scopedSpillInjection(100);
     auto task = assertResults(queryBuilder);
 
     // Expect > 0 spilled bytes unless there was no input.
-    auto inputRows = toPlanStats(task->taskStats()).at(partialNodeId).inputRows;
-    if (inputRows > 1) {
-      EXPECT_LT(0, spilledBytes(*task));
-      ASSERT_EQ(memory::spillMemoryPool()->stats().currentBytes, 0);
+    const auto partialInputRows =
+        toPlanStats(task->taskStats()).at(partialNodeId).inputRows;
+    const auto finalInputRows =
+        toPlanStats(task->taskStats()).at(finalNodeId).inputRows;
+    if (exec::injectedSpillCount() > 0) {
+      EXPECT_LT(0, spilledBytes(*task))
+          << "partial inputRows: " << partialInputRows
+          << " final inputRows: " << finalInputRows
+          << " spilledRows: " << spilledRows(*task)
+          << " spilledInputBytes: " << spilledInputBytes(*task)
+          << " spilledFiles: " << spilledFiles(*task)
+          << " injectedSpills: " << exec::injectedSpillCount();
+      ASSERT_EQ(memory::spillMemoryPool()->stats().usedBytes, 0);
       ASSERT_GT(memory::spillMemoryPool()->stats().peakBytes, 0);
       ASSERT_GE(
           memory::spillMemoryPool()->stats().peakBytes, peakSpillMemoryUsage);
     } else {
-      EXPECT_EQ(0, spilledBytes(*task));
+      EXPECT_EQ(0, spilledBytes(*task))
+          << "partial inputRows: " << partialInputRows
+          << " final inputRows: " << finalInputRows
+          << " spilledRows: " << spilledRows(*task)
+          << " spilledInputBytes: " << spilledInputBytes(*task)
+          << " spilledFiles: " << spilledFiles(*task)
+          << " injectedSpills: " << exec::injectedSpillCount();
     }
   }
 
@@ -800,9 +979,8 @@ void AggregationTestBase::testAggregationsImpl(
     assertResults(queryBuilder);
   }
 
-  // TODO: turn on this after spilling for VarianceAggregationTest pass.
-#if 0
-  if (!groupingKeys.empty() && allowInputShuffle_) {
+  if (!groupingKeys.empty() &&
+      !hasOrderSensitive(makeSource, aggregates, pool())) {
     SCOPED_TRACE("Run single with spilling");
     PlanBuilder builder(pool());
     makeSource(builder);
@@ -816,23 +994,27 @@ void AggregationTestBase::testAggregationsImpl(
     auto spillDirectory = exec::test::TempDirectoryPath::create();
 
     AssertQueryBuilder queryBuilder(builder.planNode(), duckDbQueryRunner_);
-    queryBuilder.configs(config).config(core::QueryConfig::kTestingSpillPct, "100")
+    queryBuilder.configs(config)
         .config(core::QueryConfig::kSpillEnabled, "true")
         .config(core::QueryConfig::kAggregationSpillEnabled, "true")
-        .spillDirectory(spillDirectory->path);
+        .spillDirectory(spillDirectory->getPath());
 
+    exec::TestScopedSpillInjection scopedSpillInjection(100);
     auto task = assertResults(queryBuilder);
-
-    // Expect > 0 spilled bytes unless there was no input.
-    auto inputRows =
-        toPlanStats(task->taskStats()).at(aggregationNodeId).inputRows;
-    if (inputRows > 1) {
-      EXPECT_LT(0, spilledBytes(*task));
+    if (exec::injectedSpillCount() > 0) {
+      EXPECT_LT(0, spilledBytes(*task))
+          << " spilledRows: " << spilledRows(*task)
+          << " spilledInputBytes: " << spilledInputBytes(*task)
+          << " spilledFiles: " << spilledFiles(*task)
+          << " injectedSpills: " << exec::injectedSpillCount();
     } else {
-      EXPECT_EQ(0, spilledBytes(*task));
+      EXPECT_EQ(0, spilledBytes(*task))
+          << " spilledRows: " << spilledRows(*task)
+          << " spilledInputBytes: " << spilledInputBytes(*task)
+          << " spilledFiles: " << spilledFiles(*task)
+          << " injectedSpills: " << exec::injectedSpillCount();
     }
   }
-#endif
 
   {
     SCOPED_TRACE("Run partial + intermediate + final");
@@ -904,6 +1086,70 @@ void AggregationTestBase::testAggregationsImpl(
   }
 }
 
+void AggregationTestBase::testStreamingAggregationsImpl(
+    std::function<void(PlanBuilder&)> makeSource,
+    const std::vector<std::string>& groupingKeys,
+    const std::vector<std::string>& aggregates,
+    const std::vector<std::string>& postAggregationProjections,
+    std::function<std::shared_ptr<exec::Task>(AssertQueryBuilder&)>
+        assertResults,
+    const std::unordered_map<std::string, std::string>& config) {
+  {
+    SCOPED_TRACE("Test StreamingAggregation: run single");
+    PlanBuilder builder(pool());
+    makeSource(builder);
+    builder.orderBy(groupingKeys, false)
+        .streamingAggregation(
+            groupingKeys,
+            aggregates,
+            {},
+            core::AggregationNode::Step::kSingle,
+            false);
+    if (!postAggregationProjections.empty()) {
+      builder.project(postAggregationProjections);
+    }
+
+    AssertQueryBuilder queryBuilder(builder.planNode(), duckDbQueryRunner_);
+    queryBuilder.configs(config);
+    assertResults(queryBuilder);
+  }
+
+  {
+    SCOPED_TRACE(
+        "Test StreamingAggregation: run partial + final StreamingAggregation");
+    PlanBuilder builder(pool());
+    makeSource(builder);
+    builder.orderBy(groupingKeys, false)
+        .partialStreamingAggregation(groupingKeys, aggregates)
+        .finalAggregation();
+    if (!postAggregationProjections.empty()) {
+      builder.project(postAggregationProjections);
+    }
+
+    AssertQueryBuilder queryBuilder(builder.planNode(), duckDbQueryRunner_);
+    queryBuilder.configs(config);
+    assertResults(queryBuilder);
+  }
+
+  {
+    SCOPED_TRACE(
+        "Test StreamingAggregation: run partial + intermediate + final");
+    PlanBuilder builder(pool());
+    makeSource(builder);
+    builder.orderBy(groupingKeys, false)
+        .partialStreamingAggregation(groupingKeys, aggregates)
+        .intermediateAggregation()
+        .finalAggregation();
+    if (!postAggregationProjections.empty()) {
+      builder.project(postAggregationProjections);
+    }
+
+    AssertQueryBuilder queryBuilder(builder.planNode(), duckDbQueryRunner_);
+    queryBuilder.configs(config);
+    assertResults(queryBuilder);
+  }
+}
+
 void AggregationTestBase::testAggregations(
     std::function<void(PlanBuilder&)> makeSource,
     const std::vector<std::string>& groupingKeys,
@@ -911,8 +1157,7 @@ void AggregationTestBase::testAggregations(
     const std::vector<std::string>& postAggregationProjections,
     std::function<std::shared_ptr<exec::Task>(AssertQueryBuilder&)>
         assertResults,
-    const std::unordered_map<std::string, std::string>& config,
-    bool testWithTableScan) {
+    const std::unordered_map<std::string, std::string>& config) {
   testAggregationsImpl(
       makeSource,
       groupingKeys,
@@ -921,7 +1166,23 @@ void AggregationTestBase::testAggregations(
       assertResults,
       config);
 
-  if (testWithTableScan) {
+  if (testIncremental_) {
+    SCOPED_TRACE("testIncrementalAggregation");
+    testIncrementalAggregation(makeSource, aggregates, config);
+  }
+
+  if (!hasOrderSensitive(makeSource, aggregates, pool()) &&
+      !groupingKeys.empty()) {
+    testStreamingAggregationsImpl(
+        makeSource,
+        groupingKeys,
+        aggregates,
+        postAggregationProjections,
+        assertResults,
+        config);
+  }
+
+  {
     SCOPED_TRACE("Test reading input from table scan");
     testReadFromFiles(
         makeSource,
@@ -975,6 +1236,112 @@ VectorPtr AggregationTestBase::testStreaming(
       config);
 }
 
+namespace {
+
+constexpr int kRowSizeOffset = 8;
+constexpr int kOffset = kRowSizeOffset + 8;
+
+std::unique_ptr<exec::Aggregate> createAggregateFunction(
+    const std::string& functionName,
+    const std::vector<TypePtr>& inputTypes,
+    HashStringAllocator& allocator,
+    const std::unordered_map<std::string, std::string>& config) {
+  auto [intermediateType, finalType] = getResultTypes(functionName, inputTypes);
+  core::QueryConfig queryConfig({config});
+  auto func = exec::Aggregate::create(
+      functionName,
+      core::AggregationNode::Step::kSingle,
+      inputTypes,
+      finalType,
+      queryConfig);
+  func->setAllocator(&allocator);
+  func->setOffsets(kOffset, 0, 1, 0, 2, kRowSizeOffset);
+
+  VELOX_CHECK(intermediateType->equivalent(
+      *func->intermediateType(functionName, inputTypes)));
+  VELOX_CHECK(finalType->equivalent(*func->resultType()));
+
+  return func;
+}
+
+} // namespace
+
+void AggregationTestBase::testIncrementalAggregation(
+    const std::function<void(exec::test::PlanBuilder&)>& makeSource,
+    const std::vector<std::string>& aggregates,
+    const std::unordered_map<std::string, std::string>& config) {
+  PlanBuilder builder(pool());
+  makeSource(builder);
+  auto data = AssertQueryBuilder(builder.planNode())
+                  .configs(config)
+                  .copyResults(pool());
+  auto inputSize = data->size();
+  if (inputSize == 0) {
+    return;
+  }
+
+  auto& aggregationNode = static_cast<const core::AggregationNode&>(
+      *builder.singleAggregation({}, aggregates).planNode());
+  for (int i = 0; i < aggregationNode.aggregates().size(); ++i) {
+    const auto& aggregate = aggregationNode.aggregates()[i];
+    const auto& aggregateExpr = aggregate.call;
+    const auto& functionName = aggregateExpr->name();
+    auto input = extractArgColumns(aggregateExpr, data, pool());
+
+    HashStringAllocator allocator(pool());
+    std::vector<core::LambdaTypedExprPtr> lambdas;
+    for (const auto& arg : aggregate.call->inputs()) {
+      if (auto lambda =
+              std::dynamic_pointer_cast<const core::LambdaTypedExpr>(arg)) {
+        lambdas.push_back(lambda);
+      }
+    }
+    auto queryCtxConfig = config;
+    auto func = createAggregateFunction(
+        functionName, aggregate.rawInputTypes, allocator, config);
+    auto queryCtx =
+        core::QueryCtx::create(nullptr, core::QueryConfig{queryCtxConfig});
+
+    std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator;
+    if (!lambdas.empty()) {
+      expressionEvaluator = std::make_shared<exec::SimpleExpressionEvaluator>(
+          queryCtx.get(), allocator.pool());
+      func->setLambdaExpressions(lambdas, expressionEvaluator);
+    }
+
+    std::vector<char> group(kOffset + func->accumulatorFixedWidthSize());
+    std::vector<char*> groups(inputSize, group.data());
+    std::vector<vector_size_t> indices(1, 0);
+    func->initializeNewGroups(groups.data(), indices);
+    func->addSingleGroupRawInput(
+        group.data(), SelectivityVector(inputSize), input, false);
+
+    // Extract intermediate result from the same accumulator twice and expect
+    // results to be the same.
+    auto intermediateType =
+        func->intermediateType(functionName, aggregate.rawInputTypes);
+    auto intermediateResult1 = BaseVector::create(intermediateType, 1, pool());
+    auto intermediateResult2 = BaseVector::create(intermediateType, 1, pool());
+    func->extractAccumulators(groups.data(), 1, &intermediateResult1);
+    func->extractAccumulators(groups.data(), 1, &intermediateResult2);
+    velox::test::assertEqualVectors(intermediateResult1, intermediateResult2);
+
+    // Extract values from the same accumulator twice and expect results to be
+    // the same.
+    auto result1 = BaseVector::create(func->resultType(), 1, pool());
+    auto result2 = BaseVector::create(func->resultType(), 1, pool());
+    func->extractValues(groups.data(), 1, &result1);
+    func->extractValues(groups.data(), 1, &result2);
+
+    // Destroy accumulators to avoid memory leak.
+    if (func->accumulatorUsesExternalMemory()) {
+      func->destroy(folly::Range(groups.data(), 1));
+    }
+
+    velox::test::assertEqualVectors(result1, result2);
+  }
+}
+
 VectorPtr AggregationTestBase::testStreaming(
     const std::string& functionName,
     bool testGlobal,
@@ -983,28 +1350,16 @@ VectorPtr AggregationTestBase::testStreaming(
     const std::vector<VectorPtr>& rawInput2,
     vector_size_t rawInput2Size,
     const std::unordered_map<std::string, std::string>& config) {
-  constexpr int kRowSizeOffset = 8;
-  constexpr int kOffset = kRowSizeOffset + 8;
+  std::vector<TypePtr> rawInputTypes(rawInput1.size());
+  std::transform(
+      rawInput1.begin(),
+      rawInput1.end(),
+      rawInputTypes.begin(),
+      [](const VectorPtr& vec) { return vec->type(); });
+
   HashStringAllocator allocator(pool());
-  std::vector<TypePtr> rawInputTypes;
-  for (auto& vec : rawInput1) {
-    rawInputTypes.push_back(vec->type());
-  }
-  auto [intermediateType, finalType] =
-      getResultTypes(functionName, rawInputTypes);
-  auto createFunction = [&, &finalType = finalType] {
-    core::QueryConfig queryConfig({config});
-    auto func = exec::Aggregate::create(
-        functionName,
-        core::AggregationNode::Step::kSingle,
-        rawInputTypes,
-        finalType,
-        queryConfig);
-    func->setAllocator(&allocator);
-    func->setOffsets(kOffset, 0, 1, kRowSizeOffset);
-    return func;
-  };
-  auto func = createFunction();
+  auto func =
+      createAggregateFunction(functionName, rawInputTypes, allocator, config);
   int maxRowCount = std::max(rawInput1Size, rawInput2Size);
   std::vector<char> group(kOffset + func->accumulatorFixedWidthSize());
   std::vector<char*> groups(maxRowCount, group.data());
@@ -1017,6 +1372,7 @@ VectorPtr AggregationTestBase::testStreaming(
     func->addRawInput(
         groups.data(), SelectivityVector(rawInput1Size), rawInput1, false);
   }
+  auto intermediateType = func->intermediateType(functionName, rawInputTypes);
   auto intermediate = BaseVector::create(intermediateType, 1, pool());
   func->extractAccumulators(groups.data(), 1, &intermediate);
   // Destroy accumulators to avoid memory leak.
@@ -1025,7 +1381,8 @@ VectorPtr AggregationTestBase::testStreaming(
   }
 
   // Create a new function picking up the intermediate result.
-  auto func2 = createFunction();
+  auto func2 =
+      createAggregateFunction(functionName, rawInputTypes, allocator, config);
   func2->initializeNewGroups(groups.data(), indices);
   if (testGlobal) {
     func2->addSingleGroupIntermediateResults(
@@ -1042,7 +1399,7 @@ VectorPtr AggregationTestBase::testStreaming(
     func2->addRawInput(
         groups.data(), SelectivityVector(rawInput2Size), rawInput2, false);
   }
-  auto result = BaseVector::create(finalType, 1, pool());
+  auto result = BaseVector::create(func2->resultType(), 1, pool());
   func2->extractValues(groups.data(), 1, &result);
   // Destroy accumulators to avoid memory leak.
   if (func2->accumulatorUsesExternalMemory()) {

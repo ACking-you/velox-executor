@@ -18,6 +18,8 @@
 
 #include <functional>
 #include <memory>
+#include <string>
+#include <unordered_map>
 /// Contains wrappers for common Cuda objects. Wave does not directly
 /// include Cuda headers because of interference with BitUtils.h and
 /// SimdUtils.h.
@@ -46,6 +48,9 @@ class Stream {
   /// Waits  until the stream is completed.
   void wait();
 
+  /// Enqueus a memset on 'device'.
+  void memset(void* address, int32_t value, size_t size);
+
   /// Enqueus a prefetch. Prefetches to host if 'device' is nullptr, otherwise
   /// to 'device'.
   void prefetch(Device* device, void* address, size_t size);
@@ -70,10 +75,16 @@ class Stream {
   void*& userData() {
     return userData_;
   }
+  bool getAndClearIsTransfer() {
+    auto flag = isTransfer_;
+    isTransfer_ = false;
+    return flag;
+  }
 
  protected:
   std::unique_ptr<StreamImpl> stream_;
   void* userData_{nullptr};
+  bool isTransfer_{false};
 
   friend class Event;
 };
@@ -87,7 +98,7 @@ class Event {
 
   ~Event();
 
-  ///  Recirds event on 'stream'. This must be called before other member
+  ///  Records event on 'stream'. This must be called before other member
   ///  functions.
   void record(Stream&);
 
@@ -125,6 +136,16 @@ class GpuAllocator {
   /// Frees a pointer from allocate(). 'size' must correspond to the size given
   /// to allocate(). A Memory must be freed to the same allocator it came from.
   virtual void free(void* ptr, size_t bytes) = 0;
+
+  /// True if allocates host pinned memory.
+  virtual bool isHost() const {
+    return false;
+  }
+
+  /// True if allocates device side memory.
+  virtual bool isDevice() const {
+    return false;
+  }
 
   class Deleter;
 
@@ -182,5 +203,24 @@ GpuAllocator::UniquePtr<T[]> GpuAllocator::allocate(size_t n) {
   T* ptr = static_cast<T*>(allocate(bytes));
   return UniquePtr<T[]>(ptr, Deleter(this, bytes));
 }
+
+/// Info on kernel occupancy limits.
+struct KernelInfo {
+  int32_t numRegs{0};
+  int32_t maxThreadsPerBlock;
+  int32_t sharedMemory{0};
+  int32_t maxOccupancy0{0};
+  int32_t maxOccupancy32{0};
+
+  std::string toString() const;
+};
+
+KernelInfo getRegisteredKernelInfo(const char* name);
+
+KernelInfo kernelInfo(const void* func);
+
+std::unordered_map<std::string, KernelInfo>& kernelRegistry();
+/// Prints summary of registered kernels.
+void printKernels();
 
 } // namespace facebook::velox::wave

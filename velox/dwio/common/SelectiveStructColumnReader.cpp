@@ -16,6 +16,7 @@
 
 #include "velox/dwio/common/SelectiveStructColumnReader.h"
 
+#include "velox/common/process/TraceContext.h"
 #include "velox/dwio/common/ColumnLoader.h"
 
 namespace facebook::velox::dwio::common {
@@ -52,72 +53,127 @@ uint64_t SelectiveStructColumnReaderBase::skip(uint64_t numValues) {
   return numValues;
 }
 
+void SelectiveStructColumnReaderBase::fillOutputRowsFromMutation(
+    vector_size_t size) {
+  if (mutation_->deletedRows) {
+    bits::forEachUnsetBit(mutation_->deletedRows, 0, size, [&](auto i) {
+      if ((mutation_->randomSkip == nullptr) ||
+          mutation_->randomSkip->testOne()) {
+        addOutputRow(i);
+      }
+    });
+  } else {
+    VELOX_CHECK_NOT_NULL(mutation_->randomSkip);
+    vector_size_t i = 0;
+    while (i < size) {
+      const auto skip = mutation_->randomSkip->nextSkip();
+      const auto remaining = size - i;
+      if (skip >= remaining) {
+        mutation_->randomSkip->consume(remaining);
+        break;
+      }
+      i += skip;
+      addOutputRow(i++);
+      mutation_->randomSkip->consume(skip + 1);
+    }
+  }
+}
+
+namespace {
+
+bool testFilterOnConstant(const velox::common::ScanSpec& spec) {
+  if (spec.isConstant() && !spec.constantValue()->isNullAt(0)) {
+    // Non-null constant is known value during split scheduling and filters on
+    // them should not be handled at execution level.
+    return true;
+  }
+  // Check filter on missing field.
+  return !spec.hasFilter() || spec.testNull();
+}
+
+} // namespace
+
 void SelectiveStructColumnReaderBase::next(
     uint64_t numValues,
     VectorPtr& result,
     const Mutation* mutation) {
+  process::TraceContext trace("SelectiveStructColumnReaderBase::next");
+  mutation_ = mutation;
+  hasDeletion_ = common::hasDeletion(mutation);
   if (children_.empty()) {
-    if (mutation && mutation->deletedRows) {
-      numValues -= bits::countBits(mutation->deletedRows, 0, numValues);
+    if (hasDeletion_) {
+      if (fillMutatedOutputRows_) {
+        fillOutputRowsFromMutation(numValues);
+        numValues = outputRows_.size();
+      } else {
+        if (mutation->deletedRows) {
+          numValues -= bits::countBits(mutation->deletedRows, 0, numValues);
+        }
+        if (mutation->randomSkip) {
+          numValues *= mutation->randomSkip->sampleRate();
+        }
+      }
+    }
+    for (const auto& childSpec : scanSpec_->children()) {
+      if (isChildConstant(*childSpec) && !testFilterOnConstant(*childSpec)) {
+        numValues = 0;
+        break;
+      }
     }
 
-    // no readers
+    // No readers
     // This can be either count(*) query or a query that select only
     // constant columns (partition keys or columns missing from an old file
     // due to schema evolution)
     auto resultRowVector = std::dynamic_pointer_cast<RowVector>(result);
     resultRowVector->unsafeResize(numValues);
 
-    auto& childSpecs = scanSpec_->children();
-    for (auto& childSpec : childSpecs) {
+    for (auto& childSpec : scanSpec_->children()) {
       VELOX_CHECK(childSpec->isConstant());
       if (childSpec->projectOut()) {
-        auto channel = childSpec->channel();
+        const auto channel = childSpec->channel();
         resultRowVector->childAt(channel) = BaseVector::wrapInConstant(
             numValues, 0, childSpec->constantValue());
       }
     }
     return;
   }
-  auto oldSize = rows_.size();
+
+  const auto oldSize = rows_.size();
   rows_.resize(numValues);
   if (numValues > oldSize) {
     std::iota(&rows_[oldSize], &rows_[rows_.size()], oldSize);
   }
-  mutation_ = mutation;
-  hasMutation_ = mutation && mutation->deletedRows;
   read(readOffset_, rows_, nullptr);
   getValues(outputRows(), &result);
 }
 
 void SelectiveStructColumnReaderBase::read(
     vector_size_t offset,
-    RowSet rows,
+    const RowSet& rows,
     const uint64_t* incomingNulls) {
   numReads_ = scanSpec_->newRead();
   prepareRead<char>(offset, rows, incomingNulls);
   RowSet activeRows = rows;
-  if (hasMutation_) {
+  if (hasDeletion_) {
     // We handle the mutation after prepareRead so that output rows and format
     // specific initializations (e.g. RepDef in Parquet) are done properly.
-    VELOX_DCHECK(!nullsInReadRange_, "Only top level can have mutation");
+    VELOX_DCHECK_NULL(nullsInReadRange_, "Only top level can have mutation");
     VELOX_DCHECK_EQ(
         rows.back(), rows.size() - 1, "Top level should have a dense row set");
-    bits::forEachUnsetBit(
-        mutation_->deletedRows, 0, rows.back() + 1, [&](auto i) {
-          addOutputRow(i);
-        });
+    fillOutputRowsFromMutation(rows.size());
     if (outputRows_.empty()) {
       readOffset_ = offset + rows.back() + 1;
       return;
     }
     activeRows = outputRows_;
   }
+
   const uint64_t* structNulls =
       nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr;
-  // a struct reader may have a null/non-null filter
+  // A struct reader may have a null/non-null filter
   if (scanSpec_->filter()) {
-    auto kind = scanSpec_->filter()->kind();
+    const auto kind = scanSpec_->filter()->kind();
     VELOX_CHECK(
         kind == velox::common::FilterKind::kIsNull ||
         kind == velox::common::FilterKind::kIsNotNull);
@@ -132,20 +188,27 @@ void SelectiveStructColumnReaderBase::read(
     activeRows = outputRows_;
   }
 
-  auto& childSpecs = scanSpec_->children();
+  const auto& childSpecs = scanSpec_->children();
   VELOX_CHECK(!childSpecs.empty());
   for (size_t i = 0; i < childSpecs.size(); ++i) {
-    auto& childSpec = childSpecs[i];
+    const auto& childSpec = childSpecs[i];
+    VELOX_TRACE_HISTORY_PUSH("read %s", childSpec->fieldName().c_str());
     if (isChildConstant(*childSpec)) {
+      if (!testFilterOnConstant(*childSpec)) {
+        activeRows = {};
+        break;
+      }
       continue;
     }
-    auto fieldIndex = childSpec->subscript();
-    auto reader = children_.at(fieldIndex);
+
+    const auto fieldIndex = childSpec->subscript();
+    auto* reader = children_.at(fieldIndex);
     if (reader->isTopLevel() && childSpec->projectOut() &&
         !childSpec->hasFilter() && !childSpec->extractValues()) {
       // Will make a LazyVector.
       continue;
     }
+
     advanceFieldReader(reader, offset);
     if (childSpec->hasFilter()) {
       {
@@ -181,18 +244,18 @@ void SelectiveStructColumnReaderBase::read(
 
 void SelectiveStructColumnReaderBase::recordParentNullsInChildren(
     vector_size_t offset,
-    RowSet rows) {
+    const RowSet& rows) {
   if (formatData_->parentNullsInLeaves()) {
     return;
   }
-  auto& childSpecs = scanSpec_->children();
+  const auto& childSpecs = scanSpec_->children();
   for (auto i = 0; i < childSpecs.size(); ++i) {
-    auto& childSpec = childSpecs[i];
+    const auto& childSpec = childSpecs[i];
     if (isChildConstant(*childSpec)) {
       continue;
     }
-    auto fieldIndex = childSpec->subscript();
-    auto reader = children_.at(fieldIndex);
+    const auto fieldIndex = childSpec->subscript();
+    auto* reader = children_.at(fieldIndex);
     reader->addParentNulls(
         offset,
         nullsInReadRange_ ? nullsInReadRange_->as<uint64_t>() : nullptr,
@@ -300,7 +363,7 @@ void setNullField(
 } // namespace
 
 void SelectiveStructColumnReaderBase::getValues(
-    RowSet rows,
+    const RowSet& rows,
     VectorPtr* result) {
   VELOX_CHECK(!scanSpec_->children().empty());
   VELOX_CHECK_NOT_NULL(
@@ -323,44 +386,43 @@ void SelectiveStructColumnReaderBase::getValues(
         0,
         std::move(children));
   }
+
   auto* resultRow = static_cast<RowVector*>(result->get());
   resultRow->unsafeResize(rows.size());
-  if (!rows.size()) {
+  if (rows.empty()) {
     return;
   }
-  if (nullsInReadRange_) {
-    auto readerNulls = nullsInReadRange_->as<uint64_t>();
-    auto* nulls = resultRow->mutableNulls(rows.size())->asMutable<uint64_t>();
-    for (size_t i = 0; i < rows.size(); ++i) {
-      bits::setBit(nulls, i, bits::isBitSet(readerNulls, rows[i]));
-    }
-  } else {
-    resultRow->clearNulls(0, rows.size());
-  }
+
+  setComplexNulls(rows, *result);
   bool lazyPrepared = false;
-  for (auto& childSpec : scanSpec_->children()) {
+  for (const auto& childSpec : scanSpec_->children()) {
+    VELOX_TRACE_HISTORY_PUSH("getValues %s", childSpec->fieldName().c_str());
     if (!childSpec->projectOut()) {
       continue;
     }
-    auto channel = childSpec->channel();
+
+    const auto channel = childSpec->channel();
     auto& childResult = resultRow->childAt(channel);
     if (childSpec->isConstant()) {
       setConstantField(childSpec->constantValue(), rows.size(), childResult);
       continue;
     }
-    auto index = childSpec->subscript();
+
+    const auto index = childSpec->subscript();
     // Set missing fields to be null constant, if we're in the top level struct
     // missing columns should already be a null constant from the check above.
     if (index == kConstantChildSpecSubscript) {
-      auto& childType = rowType.childAt(channel);
+      const auto& childType = rowType.childAt(channel);
       setNullField(rows.size(), childResult, childType, resultRow->pool());
       continue;
     }
+
     if (childSpec->extractValues() || childSpec->hasFilter() ||
         !children_[index]->isTopLevel()) {
       children_[index]->getValues(rows, &childResult);
       continue;
     }
+
     // LazyVector result.
     if (!lazyPrepared) {
       if (rows.size() != outputRows_.size()) {
@@ -368,21 +430,41 @@ void SelectiveStructColumnReaderBase::getValues(
       }
       lazyPrepared = true;
     }
-    auto loader =
+    auto lazyLoader =
         std::make_unique<ColumnLoader>(this, children_[index], numReads_);
     if (childResult && childResult->isLazy() && childResult.unique()) {
       static_cast<LazyVector&>(*childResult)
-          .reset(std::move(loader), rows.size());
+          .reset(std::move(lazyLoader), rows.size());
     } else {
       childResult = std::make_shared<LazyVector>(
-          &memoryPool_,
+          memoryPool_,
           resultRow->type()->childAt(channel),
           rows.size(),
-          std::move(loader),
+          std::move(lazyLoader),
           std::move(childResult));
     }
   }
   resultRow->updateContainsLazyNotLoaded();
 }
+
+namespace detail {
+
+#if XSIMD_WITH_AVX2
+
+xsimd::batch<int32_t> bitsToInt32s[256];
+
+__attribute__((constructor)) void initBitsToInt32s() {
+  for (int i = 0; i < 256; ++i) {
+    int32_t data[8];
+    for (int j = 0; j < 8; ++j) {
+      data[j] = bits::isBitSet(&i, j);
+    }
+    bitsToInt32s[i] = xsimd::load_unaligned(data);
+  }
+}
+
+#endif
+
+} // namespace detail
 
 } // namespace facebook::velox::dwio::common

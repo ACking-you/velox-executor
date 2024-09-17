@@ -40,10 +40,6 @@ namespace facebook::velox::exec::test {
 
 namespace {
 
-// TODO Avoid duplication.
-static const std::string kHiveConnectorId = "test-hive";
-static const std::string kTpchConnectorId = "test-tpch";
-
 core::TypedExprPtr parseExpr(
     const std::string& text,
     const RowTypePtr& rowType,
@@ -57,24 +53,18 @@ std::shared_ptr<HiveBucketProperty> buildHiveBucketProperty(
     const RowTypePtr rowType,
     int32_t bucketCount,
     const std::vector<std::string>& bucketColumns,
-    const std::vector<std::string>& sortByColumns) {
+    const std::vector<std::shared_ptr<const HiveSortingColumn>>& sortBy) {
   std::vector<TypePtr> bucketTypes;
   bucketTypes.reserve(bucketColumns.size());
   for (const auto& bucketColumn : bucketColumns) {
     bucketTypes.push_back(rowType->childAt(rowType->getChildIdx(bucketColumn)));
-  }
-  std::vector<std::shared_ptr<const HiveSortingColumn>> sortedBy;
-  sortedBy.reserve(sortByColumns.size());
-  for (const auto& sortByColumn : sortByColumns) {
-    sortedBy.push_back(std::make_shared<const HiveSortingColumn>(
-        sortByColumn, core::SortOrder{false, false}));
   }
   return std::make_shared<HiveBucketProperty>(
       HiveBucketProperty::Kind::kHiveCompatible,
       bucketCount,
       bucketColumns,
       bucketTypes,
-      sortedBy);
+      sortBy);
 }
 } // namespace
 
@@ -82,12 +72,17 @@ PlanBuilder& PlanBuilder::tableScan(
     const RowTypePtr& outputType,
     const std::vector<std::string>& subfieldFilters,
     const std::string& remainingFilter,
-    const RowTypePtr& dataColumns) {
+    const RowTypePtr& dataColumns,
+    const std::unordered_map<
+        std::string,
+        std::shared_ptr<connector::ColumnHandle>>& assignments) {
   return TableScanBuilder(*this)
       .outputType(outputType)
+      .assignments(assignments)
       .subfieldFilters(subfieldFilters)
       .remainingFilter(remainingFilter)
       .dataColumns(dataColumns)
+      .assignments(assignments)
       .endTableScan();
 }
 
@@ -97,7 +92,10 @@ PlanBuilder& PlanBuilder::tableScan(
     const std::unordered_map<std::string, std::string>& columnAliases,
     const std::vector<std::string>& subfieldFilters,
     const std::string& remainingFilter,
-    const RowTypePtr& dataColumns) {
+    const RowTypePtr& dataColumns,
+    const std::unordered_map<
+        std::string,
+        std::shared_ptr<connector::ColumnHandle>>& assignments) {
   return TableScanBuilder(*this)
       .tableName(tableName)
       .outputType(outputType)
@@ -105,6 +103,7 @@ PlanBuilder& PlanBuilder::tableScan(
       .subfieldFilters(subfieldFilters)
       .remainingFilter(remainingFilter)
       .dataColumns(dataColumns)
+      .assignments(assignments)
       .endTableScan();
 }
 
@@ -129,12 +128,13 @@ PlanBuilder& PlanBuilder::tpchTableScan(
   return TableScanBuilder(*this)
       .outputType(rowType)
       .tableHandle(std::make_shared<connector::tpch::TpchTableHandle>(
-          kTpchConnectorId, table, scaleFactor))
+          std::string(kTpchDefaultConnectorId), table, scaleFactor))
       .assignments(assignmentsMap)
       .endTableScan();
 }
 
 core::PlanNodePtr PlanBuilder::TableScanBuilder::build(core::PlanNodeId id) {
+  VELOX_CHECK_NOT_NULL(outputType_, "outputType must be specified");
   std::unordered_map<std::string, core::TypedExprPtr> typedMapping;
   bool hasAssignments = !(assignments_.empty());
   for (uint32_t i = 0; i < outputType_->size(); ++i) {
@@ -165,8 +165,8 @@ core::PlanNodePtr PlanBuilder::TableScanBuilder::build(core::PlanNodeId id) {
 
   SubfieldFilters filters;
   filters.reserve(subfieldFilters_.size());
-  core::QueryCtx queryCtx;
-  exec::SimpleExpressionEvaluator evaluator(&queryCtx, planBuilder_.pool_);
+  auto queryCtx = core::QueryCtx::create();
+  exec::SimpleExpressionEvaluator evaluator(queryCtx.get(), planBuilder_.pool_);
   for (const auto& filter : subfieldFilters_) {
     auto filterExpr =
         parseExpr(filter, parseType, planBuilder_.options_, planBuilder_.pool_);
@@ -340,17 +340,40 @@ PlanBuilder& PlanBuilder::filter(const std::string& filter) {
 PlanBuilder& PlanBuilder::tableWrite(
     const std::string& outputDirectoryPath,
     const dwio::common::FileFormat fileFormat,
-    const std::vector<std::string>& aggregates) {
-  return tableWrite(outputDirectoryPath, {}, 0, {}, {}, fileFormat, aggregates);
+    const std::vector<std::string>& aggregates,
+    const std::shared_ptr<dwio::common::WriterOptions>& options,
+    const std::string& outputFileName) {
+  return tableWrite(
+      outputDirectoryPath,
+      {},
+      0,
+      {},
+      {},
+      fileFormat,
+      aggregates,
+      kHiveDefaultConnectorId,
+      {},
+      options,
+      outputFileName);
 }
 
 PlanBuilder& PlanBuilder::tableWrite(
     const std::string& outputDirectoryPath,
     const std::vector<std::string>& partitionBy,
     const dwio::common::FileFormat fileFormat,
-    const std::vector<std::string>& aggregates) {
+    const std::vector<std::string>& aggregates,
+    const std::shared_ptr<dwio::common::WriterOptions>& options) {
   return tableWrite(
-      outputDirectoryPath, partitionBy, 0, {}, {}, fileFormat, aggregates);
+      outputDirectoryPath,
+      partitionBy,
+      0,
+      {},
+      {},
+      fileFormat,
+      aggregates,
+      kHiveDefaultConnectorId,
+      {},
+      options);
 }
 
 PlanBuilder& PlanBuilder::tableWrite(
@@ -359,7 +382,8 @@ PlanBuilder& PlanBuilder::tableWrite(
     int32_t bucketCount,
     const std::vector<std::string>& bucketedBy,
     const dwio::common::FileFormat fileFormat,
-    const std::vector<std::string>& aggregates) {
+    const std::vector<std::string>& aggregates,
+    const std::shared_ptr<dwio::common::WriterOptions>& options) {
   return tableWrite(
       outputDirectoryPath,
       partitionBy,
@@ -367,7 +391,10 @@ PlanBuilder& PlanBuilder::tableWrite(
       bucketedBy,
       {},
       fileFormat,
-      aggregates);
+      aggregates,
+      kHiveDefaultConnectorId,
+      {},
+      options);
 }
 
 PlanBuilder& PlanBuilder::tableWrite(
@@ -375,10 +402,13 @@ PlanBuilder& PlanBuilder::tableWrite(
     const std::vector<std::string>& partitionBy,
     int32_t bucketCount,
     const std::vector<std::string>& bucketedBy,
-    const std::vector<std::string>& sortBy,
+    const std::vector<std::shared_ptr<const HiveSortingColumn>>& sortBy,
     const dwio::common::FileFormat fileFormat,
     const std::vector<std::string>& aggregates,
-    const std::string& connectorId) {
+    const std::string_view& connectorId,
+    const std::unordered_map<std::string, std::string>& serdeParameters,
+    const std::shared_ptr<dwio::common::WriterOptions>& options,
+    const std::string& outputFileName) {
   VELOX_CHECK_NOT_NULL(planNode_, "TableWrite cannot be the source node");
   auto rowType = planNode_->outputType();
 
@@ -401,7 +431,8 @@ PlanBuilder& PlanBuilder::tableWrite(
   auto locationHandle = std::make_shared<connector::hive::LocationHandle>(
       outputDirectoryPath,
       outputDirectoryPath,
-      connector::hive::LocationHandle::TableType::kNew);
+      connector::hive::LocationHandle::TableType::kNew,
+      outputFileName);
   std::shared_ptr<HiveBucketProperty> bucketProperty;
   if (!partitionBy.empty() && bucketCount != 0) {
     bucketProperty =
@@ -412,10 +443,12 @@ PlanBuilder& PlanBuilder::tableWrite(
       locationHandle,
       fileFormat,
       bucketProperty,
-      common::CompressionKind_NONE);
+      common::CompressionKind_NONE,
+      serdeParameters,
+      options);
 
-  auto insertHandle =
-      std::make_shared<core::InsertTableHandle>(connectorId, hiveHandle);
+  auto insertHandle = std::make_shared<core::InsertTableHandle>(
+      std::string(connectorId), hiveHandle);
 
   std::shared_ptr<core::AggregationNode> aggregationNode;
   if (!aggregates.empty()) {
@@ -761,10 +794,15 @@ PlanBuilder::AggregatesAndNames PlanBuilder::createAggregateExpressionsAndNames(
     agg.distinct = untypedExpr.distinct;
 
     if (!untypedExpr.orderBy.empty()) {
-      VELOX_CHECK(
-          step == core::AggregationNode::Step::kSingle,
-          "Aggregations over sorted inputs cannot be split into partial and final: {}.",
-          aggregate)
+      auto* entry = exec::getAggregateFunctionEntry(agg.call->name());
+      const auto& metadata = entry->metadata;
+      if (metadata.orderSensitive) {
+        VELOX_CHECK(
+            step == core::AggregationNode::Step::kSingle,
+            "Order sensitive aggregation over sorted inputs cannot be split "
+            "into partial and final: {}.",
+            aggregate)
+      }
     }
 
     for (const auto& [keyExpr, order] : untypedExpr.orderBy) {

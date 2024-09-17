@@ -18,9 +18,7 @@
 
 namespace facebook::velox::aggregate::prestosql {
 
-HashStringAllocator::Position AddressableNonNullValueList::append(
-    const DecodedVector& decoded,
-    vector_size_t index,
+ByteOutputStream AddressableNonNullValueList::initStream(
     HashStringAllocator* allocator) {
   ByteOutputStream stream(allocator);
   if (!firstHeader_) {
@@ -30,71 +28,106 @@ HashStringAllocator::Position AddressableNonNullValueList::append(
     // and a next pointer. This could be adaptive, with smaller initial
     // sizes for lots of small arrays.
     static constexpr int kInitialSize = 44;
-
     currentPosition_ = allocator->newWrite(stream, kInitialSize);
     firstHeader_ = currentPosition_.header;
   } else {
     allocator->extendWrite(currentPosition_, stream);
   }
 
-  // Write hash.
-  stream.appendOne(decoded.base()->hashValueAt(decoded.index(index)));
-  // Write value.
-  exec::ContainerRowSerde::serialize(
-      *decoded.base(), decoded.index(index), stream);
+  return stream;
+}
 
+AddressableNonNullValueList::Entry AddressableNonNullValueList::append(
+    const DecodedVector& decoded,
+    vector_size_t index,
+    HashStringAllocator* allocator) {
+  return append(*decoded.base(), decoded.index(index), allocator);
+}
+
+AddressableNonNullValueList::Entry AddressableNonNullValueList::append(
+    const BaseVector& vector,
+    vector_size_t index,
+    HashStringAllocator* allocator) {
+  auto stream = initStream(allocator);
+
+  const auto hash = vector.hashValueAt(index);
+
+  const auto originalSize = stream.size();
+
+  // Write value.
+  exec::ContainerRowSerdeOptions options{};
+  exec::ContainerRowSerde::serialize(vector, index, stream, options);
   ++size_;
 
   auto startAndFinish = allocator->finishWrite(stream, 1024);
   currentPosition_ = startAndFinish.second;
-  return startAndFinish.first;
+
+  const auto writtenSize = stream.size() - originalSize;
+
+  return {startAndFinish.first, writtenSize, hash};
+}
+
+HashStringAllocator::Position AddressableNonNullValueList::appendSerialized(
+    const StringView& value,
+    HashStringAllocator* allocator) {
+  auto stream = initStream(allocator);
+
+  const auto originalSize = stream.size();
+  stream.appendStringView(value);
+  ++size_;
+
+  auto startAndFinish = allocator->finishWrite(stream, 1024);
+  currentPosition_ = startAndFinish.second;
+  VELOX_CHECK_EQ(stream.size() - originalSize, value.size());
+  return {startAndFinish.first};
 }
 
 namespace {
 
-ByteInputStream prepareRead(
-    HashStringAllocator::Position position,
-    bool skipHash) {
-  auto header = position.header;
-  auto seek = static_cast<int32_t>(position.position - header->begin());
+std::unique_ptr<ByteInputStream> prepareRead(
+    const AddressableNonNullValueList::Entry& entry) {
+  auto header = entry.offset.header;
+  auto seek = entry.offset.position - header->begin();
 
-  auto stream = HashStringAllocator::prepareRead(header);
-  stream.seekp(seek);
-  if (skipHash) {
-    stream.skip(sizeof(uint64_t));
-  }
+  auto stream = HashStringAllocator::prepareRead(header, entry.size + seek);
+  stream->seekp(seek);
   return stream;
 }
 } // namespace
 
 // static
 bool AddressableNonNullValueList::equalTo(
-    HashStringAllocator::Position left,
-    HashStringAllocator::Position right,
+    const Entry& left,
+    const Entry& right,
     const TypePtr& type) {
-  auto leftStream = prepareRead(left, true /*skipHash*/);
-  auto rightStream = prepareRead(right, true /*skipHash*/);
+  if (left.hash != right.hash) {
+    return false;
+  }
+
+  auto leftStream = prepareRead(left);
+  auto rightStream = prepareRead(right);
 
   CompareFlags compareFlags =
       CompareFlags::equality(CompareFlags::NullHandlingMode::kNullAsValue);
   return exec::ContainerRowSerde::compare(
-             leftStream, rightStream, type.get(), compareFlags) == 0;
-}
-
-// static
-uint64_t AddressableNonNullValueList::readHash(
-    HashStringAllocator::Position position) {
-  auto stream = prepareRead(position, false /*skipHash*/);
-  return stream.read<uint64_t>();
+             *leftStream, *rightStream, type.get(), compareFlags) == 0;
 }
 
 // static
 void AddressableNonNullValueList::read(
-    HashStringAllocator::Position position,
+    const Entry& position,
     BaseVector& result,
     vector_size_t index) {
-  auto stream = prepareRead(position, true /*skipHash*/);
-  exec::ContainerRowSerde::deserialize(stream, index, &result);
+  auto stream = prepareRead(position);
+  exec::ContainerRowSerde::deserialize(*stream, index, &result);
+}
+
+// static
+void AddressableNonNullValueList::readSerialized(
+    const Entry& position,
+    char* dest) {
+  auto stream = prepareRead(position);
+  stream->readBytes(dest, position.size);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

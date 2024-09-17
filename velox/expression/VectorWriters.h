@@ -103,7 +103,7 @@ struct VectorWriter<Array<V>> : public VectorWriterBase {
 
   // This should be called once all rows are processed.
   void finish() override {
-    writer_.elementsVector_->resize(writer_.valuesOffset_);
+    writer_.elementsVector()->resize(writer_.valuesOffset_);
     arrayVector_ = nullptr;
     childWriter_.finish();
   }
@@ -373,16 +373,21 @@ struct VectorWriter<
 
   void commitNull() {
     proxy_.vector_->setNull(proxy_.offset_, true);
+    finalizeNull();
+  }
+
+  void finalizeNull() override {
+    proxy_.prepareForReuse(false);
   }
 
   void commit(bool isSet) override {
     // this code path is called when the slice is top-level
     if (isSet) {
       proxy_.finalize();
+      proxy_.prepareForReuse(true);
     } else {
       commitNull();
     }
-    proxy_.prepareForReuse(isSet);
   }
 
   void setOffset(vector_size_t offset) override {
@@ -495,8 +500,7 @@ struct VectorWriter<Generic<T, comparable, orderable>>
   using exec_out_t = GenericWriter;
   using vector_t = BaseVector;
 
-  VectorWriter<Generic<T, comparable, orderable>>()
-      : writer_{castWriter_, castType_, offset_} {}
+  VectorWriter() : writer_{castWriter_, castType_, offset_} {}
 
   void setOffset(vector_size_t offset) override {
     offset_ = offset;

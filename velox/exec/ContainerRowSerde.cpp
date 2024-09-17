@@ -15,6 +15,7 @@
  */
 
 #include "velox/exec/ContainerRowSerde.h"
+#include "velox/type/FloatingPointUtil.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
 
@@ -26,13 +27,15 @@ namespace {
 void serializeSwitch(
     const BaseVector& source,
     vector_size_t index,
-    ByteOutputStream& out);
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options);
 
 template <TypeKind Kind>
 void serializeOne(
     const BaseVector& vector,
     vector_size_t index,
-    ByteOutputStream& stream) {
+    ByteOutputStream& stream,
+    const ContainerRowSerdeOptions& options) {
   using T = typename TypeTraits<Kind>::NativeType;
   stream.appendOne<T>(vector.asUnchecked<SimpleVector<T>>()->valueAt(index));
 }
@@ -41,7 +44,8 @@ template <>
 void serializeOne<TypeKind::VARCHAR>(
     const BaseVector& vector,
     vector_size_t index,
-    ByteOutputStream& stream) {
+    ByteOutputStream& stream,
+    const ContainerRowSerdeOptions& /*options*/) {
   auto string = vector.asUnchecked<SimpleVector<StringView>>()->valueAt(index);
   stream.appendOne<int32_t>(string.size());
   stream.appendStringView(string);
@@ -51,7 +55,8 @@ template <>
 void serializeOne<TypeKind::VARBINARY>(
     const BaseVector& vector,
     vector_size_t index,
-    ByteOutputStream& stream) {
+    ByteOutputStream& stream,
+    const ContainerRowSerdeOptions& /*options*/) {
   auto string = vector.asUnchecked<SimpleVector<StringView>>()->valueAt(index);
   stream.appendOne<int32_t>(string.size());
   stream.appendStringView(string);
@@ -61,7 +66,8 @@ template <>
 void serializeOne<TypeKind::ROW>(
     const BaseVector& vector,
     vector_size_t index,
-    ByteOutputStream& out) {
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options) {
   auto row = vector.wrappedVector()->asUnchecked<RowVector>();
   auto wrappedIndex = vector.wrappedIndex(index);
   const auto& type = row->type()->as<TypeKind::ROW>();
@@ -80,7 +86,7 @@ void serializeOne<TypeKind::ROW>(
   out.append<uint64_t>(nulls);
   for (auto i = 0; i < children.size(); ++i) {
     if (!bits ::isBitSet(nulls.data(), i)) {
-      serializeSwitch(*children[i], wrappedIndex, out);
+      serializeSwitch(*children[i], wrappedIndex, out, options);
     }
   }
 }
@@ -123,12 +129,13 @@ void serializeArray(
     const BaseVector& elements,
     vector_size_t offset,
     vector_size_t size,
-    ByteOutputStream& out) {
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options) {
   out.appendOne<int32_t>(size);
   writeNulls(elements, offset, size, out);
   for (auto i = 0; i < size; ++i) {
     if (!elements.isNullAt(i + offset)) {
-      serializeSwitch(elements, i + offset, out);
+      serializeSwitch(elements, i + offset, out, options);
     }
   }
 }
@@ -136,12 +143,13 @@ void serializeArray(
 void serializeArray(
     const BaseVector& elements,
     folly::Range<const vector_size_t*> indices,
-    ByteOutputStream& out) {
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options) {
   out.appendOne<int32_t>(indices.size());
   writeNulls(elements, indices, out);
   for (auto i : indices) {
     if (!elements.isNullAt(i)) {
-      serializeSwitch(elements, i, out);
+      serializeSwitch(elements, i, out, options);
     }
   }
 }
@@ -150,36 +158,45 @@ template <>
 void serializeOne<TypeKind::ARRAY>(
     const BaseVector& source,
     vector_size_t index,
-    ByteOutputStream& out) {
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options) {
   auto array = source.wrappedVector()->asUnchecked<ArrayVector>();
   auto wrappedIndex = source.wrappedIndex(index);
   serializeArray(
       *array->elements(),
       array->offsetAt(wrappedIndex),
       array->sizeAt(wrappedIndex),
-      out);
+      out,
+      options);
 }
 
 template <>
 void serializeOne<TypeKind::MAP>(
     const BaseVector& vector,
     vector_size_t index,
-    ByteOutputStream& out) {
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options) {
   auto map = vector.wrappedVector()->asUnchecked<MapVector>();
   auto wrappedIndex = vector.wrappedIndex(index);
-  auto size = map->sizeAt(wrappedIndex);
-  auto offset = map->offsetAt(wrappedIndex);
-  auto indices = map->sortedKeyIndices(wrappedIndex);
-  serializeArray(*map->mapKeys(), indices, out);
-  serializeArray(*map->mapValues(), indices, out);
+  if (options.isKey) {
+    auto indices = map->sortedKeyIndices(wrappedIndex);
+    serializeArray(*map->mapKeys(), indices, out, options);
+    serializeArray(*map->mapValues(), indices, out, options);
+  } else {
+    auto size = map->sizeAt(wrappedIndex);
+    auto offset = map->offsetAt(wrappedIndex);
+    serializeArray(*map->mapKeys(), offset, size, out, options);
+    serializeArray(*map->mapValues(), offset, size, out, options);
+  }
 }
 
 void serializeSwitch(
     const BaseVector& source,
     vector_size_t index,
-    ByteOutputStream& stream) {
+    ByteOutputStream& stream,
+    const ContainerRowSerdeOptions& options) {
   VELOX_DYNAMIC_TYPE_DISPATCH(
-      serializeOne, source.typeKind(), source, index, stream);
+      serializeOne, source.typeKind(), source, index, stream, options);
 }
 
 // Copy from serialization to vector.
@@ -712,7 +729,11 @@ uint64_t hashSwitch(ByteInputStream& stream, const Type* type);
 template <TypeKind Kind>
 uint64_t hashOne(ByteInputStream& stream, const Type* /*type*/) {
   using T = typename TypeTraits<Kind>::NativeType;
-  return folly::hasher<T>()(stream.read<T>());
+  if constexpr (std::is_floating_point_v<T>) {
+    return util::floating_point::NaNAwareHash<T>()(stream.read<T>());
+  } else {
+    return folly::hasher<T>()(stream.read<T>());
+  }
 }
 
 template <>
@@ -787,10 +808,11 @@ uint64_t hashSwitch(ByteInputStream& in, const Type* type) {
 void ContainerRowSerde::serialize(
     const BaseVector& source,
     vector_size_t index,
-    ByteOutputStream& out) {
+    ByteOutputStream& out,
+    const ContainerRowSerdeOptions& options) {
   VELOX_DCHECK(
       !source.isNullAt(index), "Null top-level values are not supported");
-  serializeSwitch(source, index, out);
+  serializeSwitch(source, index, out, options);
 }
 
 // static

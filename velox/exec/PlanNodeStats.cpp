@@ -39,6 +39,8 @@ void PlanNodeStats::addTotals(const OperatorStats& stats) {
   rawInputRows += stats.rawInputPositions;
   rawInputBytes += stats.rawInputBytes;
 
+  dynamicFilterStats.add(stats.dynamicFilterStats);
+
   outputRows += stats.outputPositions;
   outputBytes += stats.outputBytes;
   outputVectors += stats.outputVectors;
@@ -93,8 +95,11 @@ std::string PlanNodeStats::toString(bool includeInputStats) const {
     }
   }
   out << "Output: " << outputRows << " rows (" << succinctBytes(outputBytes)
-      << ", " << outputVectors << " batches)"
-      << ", Cpu time: " << succinctNanos(cpuWallTiming.cpuNanos)
+      << ", " << outputVectors << " batches)";
+  if (physicalWrittenBytes > 0) {
+    out << ", Physical written output: " << succinctBytes(physicalWrittenBytes);
+  }
+  out << ", Cpu time: " << succinctNanos(cpuWallTiming.cpuNanos)
       << ", Blocked wall time: " << succinctNanos(blockedWallNanos)
       << ", Peak memory: " << succinctBytes(peakMemoryBytes)
       << ", Memory allocations: " << numMemoryAllocations;
@@ -110,6 +115,11 @@ std::string PlanNodeStats::toString(bool includeInputStats) const {
   if (spilledRows > 0) {
     out << ", Spilled: " << spilledRows << " rows ("
         << succinctBytes(spilledBytes) << ", " << spilledFiles << " files)";
+  }
+
+  if (!dynamicFilterStats.empty()) {
+    out << ", DynamicFilter producer plan nodes: "
+        << folly::join(',', dynamicFilterStats.producerNodeIds);
   }
 
   return out.str();

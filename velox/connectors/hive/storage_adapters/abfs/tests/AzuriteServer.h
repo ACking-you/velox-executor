@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include "velox/core/Config.h"
 #include "velox/exec/tests/utils/TempDirectoryPath.h"
 
 #include <azure/storage/blobs/blob_container_client.hpp>
@@ -36,8 +35,8 @@ static const std::string AzuriteAccountKey{
     "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="};
 static const std::string AzuriteABFSEndpoint = fmt::format(
     "abfs://{}@{}.dfs.core.windows.net/",
-    AzuriteAccountName,
-    AzuriteContainerName);
+    AzuriteContainerName,
+    AzuriteAccountName);
 
 class AzuriteServer {
  public:

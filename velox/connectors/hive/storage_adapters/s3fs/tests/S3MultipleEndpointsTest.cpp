@@ -48,9 +48,7 @@ class S3MultipleEndpoints : public S3Test {
                 minioServer_->hiveConfig(),
                 ioExecutor_.get());
     connector::registerConnector(hiveConnector1);
-    auto port = facebook::velox::exec::test::getFreePort();
-    minioSecondServer_ =
-        std::make_unique<MinioServer>(fmt::format("127.0.0.1:{}", port));
+    minioSecondServer_ = std::make_unique<MinioServer>();
     minioSecondServer_->start();
     auto hiveConnector2 =
         connector::getConnectorFactory(
@@ -174,6 +172,6 @@ TEST_F(S3MultipleEndpoints, s3Join) {
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  folly::init(&argc, &argv, false);
+  folly::Init init{&argc, &argv, false};
   return RUN_ALL_TESTS();
 }

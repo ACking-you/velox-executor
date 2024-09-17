@@ -19,6 +19,7 @@
 #include "folly/json.h"
 #include "velox/common/encode/Base64.h"
 #include "velox/type/DecimalUtil.h"
+#include "velox/type/FloatingPointUtil.h"
 #include "velox/type/HugeInt.h"
 
 namespace facebook::velox {
@@ -670,7 +671,54 @@ variant variant::create(const folly::dynamic& variantobj) {
   }
 }
 
+template <TypeKind KIND>
+bool variant::lessThan(const variant& a, const variant& b) const {
+  using namespace facebook::velox::util::floating_point;
+  if (a.isNull() && !b.isNull()) {
+    return true;
+  }
+  if (a.isNull() || b.isNull()) {
+    return false;
+  }
+  using T = typename TypeTraits<KIND>::NativeType;
+  if constexpr (std::is_floating_point_v<T>) {
+    return NaNAwareLessThan<T>{}(a.value<KIND>(), b.value<KIND>());
+  }
+  return a.value<KIND>() < b.value<KIND>();
+}
+
+bool variant::operator<(const variant& other) const {
+  if (other.kind_ != this->kind_) {
+    return other.kind_ < this->kind_;
+  }
+  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(lessThan, kind_, *this, other);
+}
+
+template <TypeKind KIND>
+bool variant::equals(const variant& a, const variant& b) const {
+  using namespace facebook::velox::util::floating_point;
+  if (a.isNull() || b.isNull()) {
+    return false;
+  }
+  using T = typename TypeTraits<KIND>::NativeType;
+  if constexpr (std::is_floating_point_v<T>) {
+    return NaNAwareEquals<T>{}(a.value<KIND>(), b.value<KIND>());
+  }
+  return a.value<KIND>() == b.value<KIND>();
+}
+
+bool variant::equals(const variant& other) const {
+  if (other.kind_ != this->kind_) {
+    return false;
+  }
+  if (other.isNull()) {
+    return this->isNull();
+  }
+  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(equals, kind_, *this, other);
+}
+
 uint64_t variant::hash() const {
+  using namespace facebook::velox::util::floating_point;
   uint64_t hash = 0;
   if (isNull()) {
     return folly::Hash{}(static_cast<int32_t>(kind_));
@@ -690,9 +738,9 @@ uint64_t variant::hash() const {
     case TypeKind::BOOLEAN:
       return folly::Hash{}(value<TypeKind::BOOLEAN>());
     case TypeKind::REAL:
-      return folly::Hash{}(value<TypeKind::REAL>());
+      return NaNAwareHash<float>{}(value<TypeKind::REAL>());
     case TypeKind::DOUBLE:
-      return folly::Hash{}(value<TypeKind::DOUBLE>());
+      return NaNAwareHash<double>{}(value<TypeKind::DOUBLE>());
     case TypeKind::VARBINARY:
       return folly::Hash{}(value<TypeKind::VARBINARY>());
     case TypeKind::VARCHAR:
@@ -810,20 +858,70 @@ bool variant::lessThanWithEpsilon(const variant& other) const {
   return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(lessThan, kind_, *this, other);
 }
 
+namespace {
+
+// Compare variants of Array or Row type.
+template <TypeKind KIND>
+bool compareComplexTypeWithEpsilon(const variant& left, const variant& right) {
+  auto& leftContainer = left.value<KIND>();
+  auto& rightContainer = right.value<KIND>();
+  if (leftContainer.size() != rightContainer.size()) {
+    return false;
+  }
+  for (int32_t i = 0; i < leftContainer.size(); i++) {
+    if (!leftContainer[i].equalsWithEpsilon(rightContainer[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Compare variants of Map type.
+template <>
+bool compareComplexTypeWithEpsilon<TypeKind::MAP>(
+    const variant& left,
+    const variant& right) {
+  auto& leftMap = left.value<TypeKind::MAP>();
+  auto& rightMap = right.value<TypeKind::MAP>();
+  if (leftMap.size() != rightMap.size()) {
+    return false;
+  }
+  for (auto it = leftMap.begin(); it != leftMap.end(); ++it) {
+    auto otherIt = rightMap.find(it->first);
+    if (otherIt == rightMap.end()) {
+      return false;
+    }
+    if (!it->second.equalsWithEpsilon(otherIt->second)) {
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace
+
 // Uses kEpsilon to compare floating point types (REAL and DOUBLE).
 // For testing purposes.
 bool variant::equalsWithEpsilon(const variant& other) const {
   if (other.kind_ != this->kind_) {
     return false;
   }
-  if (other.isNull()) {
-    return this->isNull();
+  if (other.isNull() || this->isNull()) {
+    return other.isNull() && this->isNull();
   }
   if ((kind_ == TypeKind::REAL) or (kind_ == TypeKind::DOUBLE)) {
     return equalsFloatingPointWithEpsilon(*this, other);
   }
 
-  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(equals, kind_, *this, other);
+  switch (kind_) {
+    case TypeKind::ARRAY:
+      return compareComplexTypeWithEpsilon<TypeKind::ARRAY>(*this, other);
+    case TypeKind::MAP:
+      return compareComplexTypeWithEpsilon<TypeKind::MAP>(*this, other);
+    case TypeKind::ROW:
+      return compareComplexTypeWithEpsilon<TypeKind::ROW>(*this, other);
+    default:
+      return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(equals, kind_, *this, other);
+  }
 }
 
 void variant::verifyArrayElements(const std::vector<variant>& inputs) {

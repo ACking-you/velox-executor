@@ -28,7 +28,7 @@ class SelectiveListColumnReader
     : public dwio::common::SelectiveListColumnReader {
  public:
   SelectiveListColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       DwrfParams& params,
       common::ScanSpec& scanSpec);
@@ -49,10 +49,8 @@ class SelectiveListColumnReader
     childTargetReadOffset_ = 0;
   }
 
-  void readLengths(
-      int32_t* FOLLY_NONNULL lengths,
-      int32_t numLengths,
-      const uint64_t* FOLLY_NULLABLE nulls) override {
+  void readLengths(int32_t* lengths, int32_t numLengths, const uint64_t* nulls)
+      override {
     length_->next(lengths, numLengths, nulls);
   }
 
@@ -63,7 +61,7 @@ class SelectiveListColumnReader
 class SelectiveMapColumnReader : public dwio::common::SelectiveMapColumnReader {
  public:
   SelectiveMapColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       DwrfParams& params,
       common::ScanSpec& scanSpec);
@@ -88,15 +86,13 @@ class SelectiveMapColumnReader : public dwio::common::SelectiveMapColumnReader {
     childTargetReadOffset_ = 0;
   }
 
-  void readLengths(
-      int32_t* FOLLY_NONNULL lengths,
-      int32_t numLengths,
-      const uint64_t* FOLLY_NULLABLE nulls) override {
+  void readLengths(int32_t* lengths, int32_t numLengths, const uint64_t* nulls)
+      override {
     length_->next(lengths, numLengths, nulls);
   }
 
  private:
-  std::unique_ptr<dwio::common::IntDecoder</*isSigned*/ false>> length_;
+  std::unique_ptr<dwio::common::IntDecoder</*isSigned=*/false>> length_;
 };
 
 } // namespace facebook::velox::dwrf

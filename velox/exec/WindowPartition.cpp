@@ -20,12 +20,73 @@ namespace facebook::velox::exec {
 WindowPartition::WindowPartition(
     RowContainer* data,
     const folly::Range<char**>& rows,
-    const std::vector<exec::RowColumn>& columns,
-    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo)
-    : data_(data),
+    const std::vector<column_index_t>& inputMapping,
+    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo,
+    bool partial,
+    bool complete)
+    : partial_(partial),
+      data_(data),
       partition_(rows),
-      columns_(columns),
-      sortKeyInfo_(sortKeyInfo) {}
+      complete_(complete),
+      inputMapping_(inputMapping),
+      sortKeyInfo_(sortKeyInfo) {
+  VELOX_CHECK_NE(partial_, complete_);
+  VELOX_CHECK_NE(complete_, partition_.empty());
+
+  for (auto index : inputMapping_) {
+    columns_.emplace_back(data_->columnAt(index));
+  }
+}
+
+WindowPartition::WindowPartition(
+    RowContainer* data,
+    const folly::Range<char**>& rows,
+    const std::vector<column_index_t>& inputMapping,
+    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo)
+    : WindowPartition(data, rows, inputMapping, sortKeyInfo, false, true) {}
+
+WindowPartition::WindowPartition(
+    RowContainer* data,
+    const std::vector<column_index_t>& inputMapping,
+    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo)
+    : WindowPartition(data, {}, inputMapping, sortKeyInfo, true, false) {}
+
+void WindowPartition::addRows(const std::vector<char*>& rows) {
+  checkPartial();
+  rows_.insert(rows_.end(), rows.begin(), rows.end());
+  partition_ = folly::Range(rows_.data(), rows_.size());
+}
+
+void WindowPartition::eraseRows(vector_size_t numRows) {
+  checkPartial();
+  VELOX_CHECK_GE(data_->numRows(), numRows);
+  data_->eraseRows(folly::Range<char**>(rows_.data(), numRows));
+}
+
+void WindowPartition::removeProcessedRows(vector_size_t numRows) {
+  checkPartial();
+
+  VELOX_CHECK_NULL(previousRow_);
+  if (complete_ && rows_.size() == numRows) {
+    eraseRows(numRows);
+  } else {
+    eraseRows(numRows - 1);
+    previousRow_ = rows_[numRows - 1];
+  }
+
+  rows_.erase(rows_.begin(), rows_.begin() + numRows);
+  partition_ = folly::Range(rows_.data(), rows_.size());
+  startRow_ += numRows;
+}
+
+vector_size_t WindowPartition::numRowsForProcessing(
+    vector_size_t partitionOffset) const {
+  if (partial_) {
+    return partition_.size();
+  } else {
+    return partition_.size() - partitionOffset;
+  }
+}
 
 void WindowPartition::extractColumn(
     int32_t columnIndex,
@@ -36,6 +97,7 @@ void WindowPartition::extractColumn(
       partition_.data(),
       rowNumbers,
       columns_[columnIndex],
+      data_->columnHasNulls(inputMapping_[columnIndex]),
       resultOffset,
       result);
 }
@@ -46,10 +108,12 @@ void WindowPartition::extractColumn(
     vector_size_t numRows,
     vector_size_t resultOffset,
     const VectorPtr& result) const {
+  VELOX_CHECK_GE(partitionOffset, startRow_);
   RowContainer::extractColumn(
-      partition_.data() + partitionOffset,
+      partition_.data() + partitionOffset - startRow_,
       numRows,
       columns_[columnIndex],
+      data_->columnHasNulls(inputMapping_[columnIndex]),
       resultOffset,
       result);
 }
@@ -85,7 +149,7 @@ std::pair<vector_size_t, vector_size_t> findMinMaxFrameBounds(
   return {minFrame, maxFrame};
 }
 
-}; // namespace
+} // namespace
 
 std::optional<std::pair<vector_size_t, vector_size_t>>
 WindowPartition::extractNulls(
@@ -126,48 +190,84 @@ bool WindowPartition::compareRowsWithSortKeys(const char* lhs, const char* rhs)
   return false;
 }
 
+vector_size_t WindowPartition::findPeerRowEndIndex(
+    vector_size_t startRow,
+    vector_size_t lastRow,
+    const std::function<bool(const char*, const char*)>& peerCompare) {
+  auto peerEnd = startRow;
+  while (peerEnd <= lastRow) {
+    if (peerCompare(
+            partition_[startRow - startRow_],
+            partition_[peerEnd - startRow_])) {
+      break;
+    }
+    ++peerEnd;
+  }
+  return peerEnd;
+}
+
+void WindowPartition::removePreviousRow() {
+  VELOX_CHECK_NOT_NULL(previousRow_);
+  data_->eraseRows(folly::Range<char**>(&previousRow_, 1));
+  previousRow_ = nullptr;
+}
+
 std::pair<vector_size_t, vector_size_t> WindowPartition::computePeerBuffers(
     vector_size_t start,
     vector_size_t end,
     vector_size_t prevPeerStart,
     vector_size_t prevPeerEnd,
     vector_size_t* rawPeerStarts,
-    vector_size_t* rawPeerEnds) const {
-  auto peerCompare = [&](const char* lhs, const char* rhs) -> bool {
+    vector_size_t* rawPeerEnds) {
+  const auto peerCompare = [&](const char* lhs, const char* rhs) -> bool {
     return compareRowsWithSortKeys(lhs, rhs);
   };
 
-  VELOX_CHECK_LE(end, numRows());
+  VELOX_CHECK_LE(end, numRows() + startRow_);
 
-  auto lastPartitionRow = numRows() - 1;
+  auto lastPartitionRow = numRows() + startRow_ - 1;
   auto peerStart = prevPeerStart;
   auto peerEnd = prevPeerEnd;
-  for (auto i = start, j = 0; i < end; i++, j++) {
-    // When traversing input partition rows, the peers are the rows
-    // with the same values for the ORDER BY clause. These rows
-    // are equal in some ways and affect the results of ranking functions.
-    // This logic exploits the fact that all rows between the peerStart
-    // and peerEnd have the same values for rawPeerStarts and rawPeerEnds.
-    // So we can compute them just once and reuse across the rows in that peer
-    // interval. Note: peerStart and peerEnd can be maintained across
-    // getOutput calls. Hence, they are returned to the caller.
 
-    if (i == 0 || i >= peerEnd) {
-      // Compute peerStart and peerEnd rows for the first row of the partition
-      // or when past the previous peerGroup.
-      peerStart = i;
-      peerEnd = i;
-      while (peerEnd <= lastPartitionRow) {
-        if (peerCompare(partition_[peerStart], partition_[peerEnd])) {
-          break;
-        }
-        peerEnd++;
+  size_t next = start;
+  size_t index{0};
+  if (partial_ && start > 0) {
+    const auto peerGroup = peerCompare(previousRow_, partition_[0]);
+
+    // The first row is the last row in previous batch so delete it after used
+    // for the first peer group detection.
+    removePreviousRow();
+
+    if (!peerGroup) {
+      peerEnd = findPeerRowEndIndex(start, lastPartitionRow, peerCompare);
+
+      for (; next < std::min(end, peerEnd); ++next, ++index) {
+        rawPeerStarts[index] = peerStart;
+        rawPeerEnds[index] = peerEnd - 1;
       }
     }
-
-    rawPeerStarts[j] = peerStart;
-    rawPeerEnds[j] = peerEnd - 1;
   }
+
+  for (; next < end; ++next, ++index) {
+    // When traversing input partition rows, the peers are the rows with the
+    // same values for the ORDER BY clause. These rows are equal in some ways
+    // and affect the results of ranking functions. This logic exploits the fact
+    // that all rows between the peerStart and peerEnd have the same values for
+    // rawPeerStarts and rawPeerEnds. So we can compute them just once and reuse
+    // across the rows in that peer interval. Note: peerStart and peerEnd can be
+    // maintained across getOutput calls. Hence, they are returned to the
+    // caller.
+    if (next == 0 || next >= peerEnd) {
+      // Compute peerStart and peerEnd rows for the first row of the partition
+      // or when past the previous peerGroup.
+      peerStart = next;
+      peerEnd = findPeerRowEndIndex(peerStart, lastPartitionRow, peerCompare);
+    }
+
+    rawPeerStarts[index] = peerStart;
+    rawPeerEnds[index] = peerEnd - 1;
+  }
+  VELOX_CHECK_EQ(index, end - start);
   return {peerStart, peerEnd};
 }
 
@@ -180,53 +280,47 @@ std::pair<vector_size_t, vector_size_t> WindowPartition::computePeerBuffers(
 // largest value < frame bound or (smallest value > frame bound for
 // descending). After finding that point it does a sequential search for the
 // required value.
-template <bool isAscending>
 vector_size_t WindowPartition::searchFrameValue(
     bool firstMatch,
     vector_size_t start,
     vector_size_t end,
     vector_size_t currentRow,
     column_index_t orderByColumn,
-    column_index_t frameColumn) const {
+    column_index_t frameColumn,
+    const CompareFlags& flags) const {
   auto current = partition_[currentRow];
-  bool crossedBound = false;
   vector_size_t begin = start;
   vector_size_t finish = end;
-  int compareResult;
   while (finish - begin >= 2) {
     auto mid = (begin + finish) / 2;
-    compareResult =
-        data_->compare(partition_[mid], current, orderByColumn, frameColumn);
-    if constexpr (isAscending) {
-      crossedBound = compareResult >= 0;
-    } else {
-      crossedBound = compareResult <= 0;
-    }
+    auto compareResult = data_->compare(
+        partition_[mid], current, orderByColumn, frameColumn, flags);
 
-    if (crossedBound) {
+    if (compareResult >= 0) {
+      // Search in the first half of the column.
       finish = mid;
     } else {
+      // Search in the second half of the column.
       begin = mid;
     }
   }
 
-  return linearSearchFrameValue<isAscending>(
-      firstMatch, begin, end, currentRow, orderByColumn, frameColumn);
+  return linearSearchFrameValue(
+      firstMatch, begin, end, currentRow, orderByColumn, frameColumn, flags);
 }
 
-template <bool isAscending>
 vector_size_t WindowPartition::linearSearchFrameValue(
     bool firstMatch,
     vector_size_t start,
     vector_size_t end,
     vector_size_t currentRow,
     column_index_t orderByColumn,
-    column_index_t frameColumn) const {
+    column_index_t frameColumn,
+    const CompareFlags& flags) const {
   auto current = partition_[currentRow];
-  bool crossedBound = false;
   for (vector_size_t i = start; i < end; ++i) {
-    auto compareResult =
-        data_->compare(partition_[i], current, orderByColumn, frameColumn);
+    auto compareResult = data_->compare(
+        partition_[i], current, orderByColumn, frameColumn, flags);
 
     // The bound value was found. Return if firstMatch required.
     // If the last match is required, then we need to find the first row that
@@ -237,16 +331,11 @@ vector_size_t WindowPartition::linearSearchFrameValue(
       }
     }
 
-    if constexpr (isAscending) {
-      crossedBound = compareResult > 0;
-    } else {
-      crossedBound = compareResult < 0;
-    }
     // Bound is crossed. Last match needs the previous row.
     // But for first row matches, this is the first
     // row that has crossed, but not equals boundary (The equal boundary case
     // is covered by the condition above). So the bound matches this row itself.
-    if (crossedBound) {
+    if (compareResult > 0) {
       if (firstMatch) {
         return i;
       } else {
@@ -260,30 +349,46 @@ vector_size_t WindowPartition::linearSearchFrameValue(
   return end == numRows() ? numRows() + 1 : -1;
 }
 
-template <bool isAscending>
 void WindowPartition::updateKRangeFrameBounds(
     bool firstMatch,
     bool isPreceding,
+    const CompareFlags& flags,
     vector_size_t startRow,
     vector_size_t numRows,
     column_index_t frameColumn,
     const vector_size_t* rawPeerBounds,
     vector_size_t* rawFrameBounds) const {
   column_index_t orderByColumn = sortKeyInfo_[0].first;
-  RowColumn frameRowColumn = data_->columnAt(frameColumn);
+  column_index_t mappedFrameColumn = inputMapping_[frameColumn];
 
   vector_size_t start = 0;
   vector_size_t end;
+  RowColumn frameRowColumn = columns_[frameColumn];
+  RowColumn orderByRowColumn = columns_[inputMapping_[orderByColumn]];
   for (auto i = 0; i < numRows; i++) {
     auto currentRow = startRow + i;
-    bool frameIsNull = RowContainer::isNullAt(
-        partition_[currentRow],
-        frameRowColumn.nullByte(),
-        frameRowColumn.nullMask());
+    auto* partitionRow = partition_[currentRow];
 
-    // For NULL values, CURRENT ROW semantics apply. So get frame bound from
-    // peer buffer.
-    if (frameIsNull) {
+    // The user is expected to set the frame column equal to NULL when the
+    // ORDER BY value is NULL and not in any other case. Validate this
+    // assumption.
+    VELOX_DCHECK_EQ(
+        RowContainer::isNullAt(
+            partitionRow, frameRowColumn.nullByte(), frameRowColumn.nullMask()),
+        RowContainer::isNullAt(
+            partitionRow,
+            orderByRowColumn.nullByte(),
+            orderByRowColumn.nullMask()));
+
+    // If the frame is NULL or 0 preceding or 0 following then the current row
+    // has same values for order by and frame column. In that case
+    // the bound matches the peer row for this row.
+    if (data_->compare(
+            partitionRow,
+            partitionRow,
+            orderByColumn,
+            mappedFrameColumn,
+            flags) == 0) {
       rawFrameBounds[i] = rawPeerBounds[i];
     } else {
       // If the search is for a preceding bound then rows between
@@ -296,8 +401,14 @@ void WindowPartition::updateKRangeFrameBounds(
         start = currentRow;
         end = partition_.size();
       }
-      rawFrameBounds[i] = searchFrameValue<isAscending>(
-          firstMatch, start, end, currentRow, orderByColumn, frameColumn);
+      rawFrameBounds[i] = searchFrameValue(
+          firstMatch,
+          start,
+          end,
+          currentRow,
+          orderByColumn,
+          mappedFrameColumn,
+          flags);
     }
   }
 }
@@ -310,26 +421,19 @@ void WindowPartition::computeKRangeFrameBounds(
     vector_size_t numRows,
     const vector_size_t* rawPeerBuffer,
     vector_size_t* rawFrameBounds) const {
+  CompareFlags flags;
+  flags.ascending = sortKeyInfo_[0].second.isAscending();
+  flags.nullsFirst = sortKeyInfo_[0].second.isNullsFirst();
   // Start bounds require first match. End bounds require last match.
-  if (sortKeyInfo_[0].second.isAscending()) {
-    updateKRangeFrameBounds<true>(
-        isStartBound,
-        isPreceding,
-        startRow,
-        numRows,
-        frameColumn,
-        rawPeerBuffer,
-        rawFrameBounds);
-  } else {
-    updateKRangeFrameBounds<false>(
-        isStartBound,
-        isPreceding,
-        startRow,
-        numRows,
-        frameColumn,
-        rawPeerBuffer,
-        rawFrameBounds);
-  }
+  updateKRangeFrameBounds(
+      isStartBound,
+      isPreceding,
+      flags,
+      startRow,
+      numRows,
+      frameColumn,
+      rawPeerBuffer,
+      rawFrameBounds);
 }
 
 } // namespace facebook::velox::exec

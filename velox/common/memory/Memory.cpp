@@ -15,6 +15,11 @@
  */
 
 #include "velox/common/memory/Memory.h"
+
+#include <atomic>
+
+#include "velox/common/base/Counters.h"
+#include "velox/common/base/StatsReporter.h"
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/MmapAllocator.h"
 
@@ -23,16 +28,20 @@ DECLARE_int32(velox_memory_num_shared_leaf_pools);
 namespace facebook::velox::memory {
 namespace {
 constexpr std::string_view kSysRootName{"__sys_root__"};
+constexpr std::string_view kSysSharedLeafNamePrefix{"__sys_shared_leaf__"};
 
-std::mutex& instanceMutex() {
-  static std::mutex kMutex;
-  return kMutex;
-}
+struct SingletonState {
+  ~SingletonState() {
+    delete instance.load(std::memory_order_acquire);
+  }
 
-// Must be called while holding a lock over instanceMutex().
-std::unique_ptr<MemoryManager>& instance() {
-  static std::unique_ptr<MemoryManager> kInstance;
-  return kInstance;
+  std::atomic<MemoryManager*> instance{nullptr};
+  std::mutex mutex;
+};
+
+SingletonState& singletonState() {
+  static SingletonState state;
+  return state;
 }
 
 std::shared_ptr<MemoryAllocator> createAllocator(
@@ -40,46 +49,101 @@ std::shared_ptr<MemoryAllocator> createAllocator(
   if (options.useMmapAllocator) {
     MmapAllocator::Options mmapOptions;
     mmapOptions.capacity = options.allocatorCapacity;
+    mmapOptions.largestSizeClass = options.largestSizeClassPages;
     mmapOptions.useMmapArena = options.useMmapArena;
     mmapOptions.mmapArenaCapacityRatio = options.mmapArenaCapacityRatio;
     return std::make_shared<MmapAllocator>(mmapOptions);
   } else {
-    return std::make_shared<MallocAllocator>(options.allocatorCapacity);
+    return std::make_shared<MallocAllocator>(
+        options.allocatorCapacity,
+        options.allocationSizeThresholdWithReservation);
   }
 }
 
 std::unique_ptr<MemoryArbitrator> createArbitrator(
     const MemoryManagerOptions& options) {
   // TODO: consider to reserve a small amount of memory to compensate for the
-  // non-reclaimable cache memory which are pinned by query accesses if enabled.
-  return MemoryArbitrator::create(
-      {.kind = options.arbitratorKind,
-       .capacity =
-           std::min(options.arbitratorCapacity, options.allocatorCapacity),
-       .memoryPoolTransferCapacity = options.memoryPoolTransferCapacity,
-       .memoryReclaimWaitMs = options.memoryReclaimWaitMs,
-       .arbitrationStateCheckCb = options.arbitrationStateCheckCb,
-       .checkUsageLeak = options.checkUsageLeak});
+  //  non-reclaimable cache memory which are pinned by query accesses if
+  //  enabled.
+
+  // TODO(jtan6): [Config Refactor] clean up the if condition after Prestissimo
+  //  switched to use extra configs map.
+  if (options.extraArbitratorConfigs.empty()) {
+    std::unordered_map<std::string, std::string> extraArbitratorConfigs;
+    try {
+      // The literal string is temporary in order to not depend on
+      // SharedArbitrator class. After Prestissimo switches, this part of the
+      // code will be removed.
+      extraArbitratorConfigs["reserved-capacity"] =
+          folly::to<std::string>(options.arbitratorReservedCapacity) + "B";
+      extraArbitratorConfigs["memory-pool-initial-capacity"] =
+          folly::to<std::string>(options.memoryPoolInitCapacity) + "B";
+      extraArbitratorConfigs["memory-pool-reserved-capacity"] =
+          folly::to<std::string>(options.memoryPoolReservedCapacity) + "B";
+      extraArbitratorConfigs["memory-pool-transfer-capacity"] =
+          folly::to<std::string>(options.memoryPoolTransferCapacity) + "B";
+      extraArbitratorConfigs["fast-exponential-growth-capacity-limit"] =
+          folly::to<std::string>(options.fastExponentialGrowthCapacityLimit) +
+          "B";
+      extraArbitratorConfigs["slow-capacity-grow-pct"] =
+          folly::to<std::string>(options.slowCapacityGrowPct);
+      extraArbitratorConfigs["memory-pool-min-free-capacity"] =
+          folly::to<std::string>(options.memoryPoolMinFreeCapacity) + "B";
+      extraArbitratorConfigs["memory-pool-min-free-capacity-pct"] =
+          folly::to<std::string>(options.memoryPoolMinFreeCapacityPct);
+      extraArbitratorConfigs["memory-reclaim-max-wait-time"] =
+          folly::to<std::string>(options.memoryReclaimWaitMs) + "ms";
+      extraArbitratorConfigs["global-arbitration-enabled"] =
+          folly::to<std::string>(options.globalArbitrationEnabled);
+      extraArbitratorConfigs["check-usage-leak"] =
+          folly::to<std::string>(options.checkUsageLeak);
+    } catch (const std::exception& e) {
+      VELOX_USER_FAIL("Failed to parse extra arbitrator configs: {}", e.what());
+    }
+    return MemoryArbitrator::create(
+        {.kind = options.arbitratorKind,
+         .capacity =
+             std::min(options.arbitratorCapacity, options.allocatorCapacity),
+         .arbitrationStateCheckCb = options.arbitrationStateCheckCb,
+         .extraConfigs = extraArbitratorConfigs});
+  } else {
+    return MemoryArbitrator::create(
+        {.kind = options.arbitratorKind,
+         .capacity =
+             std::min(options.arbitratorCapacity, options.allocatorCapacity),
+         .arbitrationStateCheckCb = options.arbitrationStateCheckCb,
+         .extraConfigs = options.extraArbitratorConfigs});
+  }
+}
+
+std::vector<std::shared_ptr<MemoryPool>> createSharedLeafMemoryPools(
+    MemoryPool& sysPool) {
+  VELOX_CHECK_EQ(sysPool.name(), kSysRootName);
+  std::vector<std::shared_ptr<MemoryPool>> leafPools;
+  const size_t numSharedPools =
+      std::max(1, FLAGS_velox_memory_num_shared_leaf_pools);
+  leafPools.reserve(numSharedPools);
+  for (size_t i = 0; i < numSharedPools; ++i) {
+    leafPools.emplace_back(
+        sysPool.addLeafChild(fmt::format("{}{}", kSysSharedLeafNamePrefix, i)));
+  }
+  return leafPools;
 }
 } // namespace
 
 MemoryManager::MemoryManager(const MemoryManagerOptions& options)
     : allocator_{createAllocator(options)},
-      poolInitCapacity_(options.memoryPoolInitCapacity),
       arbitrator_(createArbitrator(options)),
       alignment_(std::max(MemoryAllocator::kMinAlignment, options.alignment)),
       checkUsageLeak_(options.checkUsageLeak),
       debugEnabled_(options.debugEnabled),
       coreOnAllocationFailureEnabled_(options.coreOnAllocationFailureEnabled),
+      disableMemoryPoolTracking_(options.disableMemoryPoolTracking),
       poolDestructionCb_([&](MemoryPool* pool) { dropPool(pool); }),
-      poolGrowCb_([&](MemoryPool* pool, uint64_t targetBytes) {
-        return growPool(pool, targetBytes);
-      }),
-      defaultRoot_{std::make_shared<MemoryPoolImpl>(
+      sysRoot_{std::make_shared<MemoryPoolImpl>(
           this,
           std::string(kSysRootName),
           MemoryPool::Kind::kAggregate,
-          nullptr,
           nullptr,
           nullptr,
           nullptr,
@@ -92,20 +156,23 @@ MemoryManager::MemoryManager(const MemoryManagerOptions& options)
               .debugEnabled = options.debugEnabled,
               .coreOnAllocationFailureEnabled =
                   options.coreOnAllocationFailureEnabled})},
-      spillPool_{addLeafPool("__sys_spilling__")} {
+      spillPool_{addLeafPool("__sys_spilling__")},
+      tracePool_{addLeafPool("__sys_tracing__")},
+      sharedLeafPools_(createSharedLeafMemoryPools(*sysRoot_)) {
   VELOX_CHECK_NOT_NULL(allocator_);
   VELOX_CHECK_NOT_NULL(arbitrator_);
   VELOX_USER_CHECK_GE(capacity(), 0);
   VELOX_CHECK_GE(allocator_->capacity(), arbitrator_->capacity());
   MemoryAllocator::alignmentCheck(0, alignment_);
-  defaultRoot_->grow(defaultRoot_->maxCapacity());
-  const size_t numSharedPools =
-      std::max(1, FLAGS_velox_memory_num_shared_leaf_pools);
-  sharedLeafPools_.reserve(numSharedPools);
-  for (size_t i = 0; i < numSharedPools; ++i) {
-    sharedLeafPools_.emplace_back(
-        addLeafPool(fmt::format("default_shared_leaf_pool_{}", i)));
-  }
+  const bool ret = sysRoot_->grow(sysRoot_->maxCapacity(), 0);
+  VELOX_CHECK(
+      ret,
+      "Failed to set max capacity {} for {}",
+      succinctBytes(sysRoot_->maxCapacity()),
+      sysRoot_->name());
+  VELOX_CHECK_EQ(
+      sharedLeafPools_.size(),
+      std::max(1, FLAGS_velox_memory_num_shared_leaf_pools));
 }
 
 MemoryManager::~MemoryManager() {
@@ -127,40 +194,49 @@ MemoryManager::~MemoryManager() {
 // static
 MemoryManager& MemoryManager::deprecatedGetInstance(
     const MemoryManagerOptions& options) {
-  std::lock_guard<std::mutex> l(instanceMutex());
-  auto& instanceRef = instance();
-  if (instanceRef == nullptr) {
-    instanceRef = std::make_unique<MemoryManager>(options);
+  auto& state = singletonState();
+  if (auto* instance = state.instance.load(std::memory_order_acquire)) {
+    return *instance;
   }
-  return *instanceRef;
+
+  std::lock_guard<std::mutex> l(state.mutex);
+  auto* instance = state.instance.load(std::memory_order_acquire);
+  if (instance != nullptr) {
+    return *instance;
+  }
+  instance = new MemoryManager(options);
+  state.instance.store(instance, std::memory_order_release);
+  return *instance;
 }
 
 // static
 void MemoryManager::initialize(const MemoryManagerOptions& options) {
-  std::lock_guard<std::mutex> l(instanceMutex());
-  auto& instanceRef = instance();
+  auto& state = singletonState();
+  std::lock_guard<std::mutex> l(state.mutex);
+  auto* instance = state.instance.load(std::memory_order_acquire);
   VELOX_CHECK_NULL(
-      instanceRef,
+      instance,
       "The memory manager has already been set: {}",
-      instanceRef->toString());
-  instanceRef = std::make_unique<MemoryManager>(options);
+      instance->toString());
+  instance = new MemoryManager(options);
+  state.instance.store(instance, std::memory_order_release);
 }
 
 // static.
 MemoryManager* MemoryManager::getInstance() {
-  std::lock_guard<std::mutex> l(instanceMutex());
-  auto& instanceRef = instance();
-  VELOX_CHECK_NOT_NULL(instanceRef, "The memory manager is not set");
-  return instanceRef.get();
+  auto* instance = singletonState().instance.load(std::memory_order_acquire);
+  VELOX_CHECK_NOT_NULL(instance, "The memory manager is not set");
+  return instance;
 }
 
 // static.
 MemoryManager& MemoryManager::testingSetInstance(
     const MemoryManagerOptions& options) {
-  std::lock_guard<std::mutex> l(instanceMutex());
-  auto& instanceRef = instance();
-  instanceRef = std::make_unique<MemoryManager>(options);
-  return *instanceRef;
+  auto& state = singletonState();
+  std::lock_guard<std::mutex> l(state.mutex);
+  auto* instance = new MemoryManager(options);
+  delete state.instance.exchange(instance, std::memory_order_acq_rel);
+  return *instance;
 }
 
 int64_t MemoryManager::capacity() const {
@@ -171,9 +247,28 @@ uint16_t MemoryManager::alignment() const {
   return alignment_;
 }
 
+std::shared_ptr<MemoryPool> MemoryManager::createRootPool(
+    std::string poolName,
+    std::unique_ptr<MemoryReclaimer>& reclaimer,
+    MemoryPool::Options& options) {
+  auto pool = std::make_shared<MemoryPoolImpl>(
+      this,
+      poolName,
+      MemoryPool::Kind::kAggregate,
+      nullptr,
+      std::move(reclaimer),
+      poolDestructionCb_,
+      options);
+  VELOX_CHECK_EQ(pool->capacity(), 0);
+  arbitrator_->addPool(pool);
+  RECORD_HISTOGRAM_METRIC_VALUE(
+      kMetricMemoryPoolInitialCapacityBytes, pool->capacity());
+  return pool;
+}
+
 std::shared_ptr<MemoryPool> MemoryManager::addRootPool(
     const std::string& name,
-    int64_t capacity,
+    int64_t maxCapacity,
     std::unique_ptr<MemoryReclaimer> reclaimer) {
   std::string poolName = name;
   if (poolName.empty()) {
@@ -183,28 +278,21 @@ std::shared_ptr<MemoryPool> MemoryManager::addRootPool(
 
   MemoryPool::Options options;
   options.alignment = alignment_;
-  options.maxCapacity = capacity;
+  options.maxCapacity = maxCapacity;
   options.trackUsage = true;
   options.debugEnabled = debugEnabled_;
   options.coreOnAllocationFailureEnabled = coreOnAllocationFailureEnabled_;
 
-  folly::SharedMutex::WriteHolder guard{mutex_};
+  if (disableMemoryPoolTracking_) {
+    return createRootPool(poolName, reclaimer, options);
+  }
+
+  std::unique_lock guard{mutex_};
   if (pools_.find(poolName) != pools_.end()) {
     VELOX_FAIL("Duplicate root pool name found: {}", poolName);
   }
-  auto pool = std::make_shared<MemoryPoolImpl>(
-      this,
-      poolName,
-      MemoryPool::Kind::kAggregate,
-      nullptr,
-      std::move(reclaimer),
-      poolGrowCb_,
-      poolDestructionCb_,
-      options);
+  auto pool = createRootPool(poolName, reclaimer, options);
   pools_.emplace(poolName, pool);
-  VELOX_CHECK_EQ(pool->capacity(), 0);
-  arbitrator_->growCapacity(
-      pool.get(), std::min<uint64_t>(poolInitCapacity_, capacity));
   return pool;
 }
 
@@ -216,34 +304,33 @@ std::shared_ptr<MemoryPool> MemoryManager::addLeafPool(
     static std::atomic<int64_t> poolId{0};
     poolName = fmt::format("default_leaf_{}", poolId++);
   }
-  return defaultRoot_->addLeafChild(poolName, threadSafe, nullptr);
+  return sysRoot_->addLeafChild(poolName, threadSafe, nullptr);
 }
 
-bool MemoryManager::growPool(MemoryPool* pool, uint64_t incrementBytes) {
-  VELOX_CHECK_NOT_NULL(pool);
-  VELOX_CHECK_NE(pool->capacity(), kMaxMemory);
-  return arbitrator_->growCapacity(pool, getAlivePools(), incrementBytes);
-}
-
-uint64_t MemoryManager::shrinkPools(uint64_t targetBytes) {
-  return arbitrator_->shrinkCapacity(getAlivePools(), targetBytes);
+uint64_t MemoryManager::shrinkPools(
+    uint64_t targetBytes,
+    bool allowSpill,
+    bool allowAbort) {
+  return arbitrator_->shrinkCapacity(targetBytes, allowSpill, allowAbort);
 }
 
 void MemoryManager::dropPool(MemoryPool* pool) {
+  VELOX_DCHECK_EQ(pool->reservedBytes(), 0);
+  arbitrator_->removePool(pool);
+  if (disableMemoryPoolTracking_) {
+    return;
+  }
   VELOX_CHECK_NOT_NULL(pool);
-  folly::SharedMutex::WriteHolder guard{mutex_};
+  std::unique_lock guard{mutex_};
   auto it = pools_.find(pool->name());
   if (it == pools_.end()) {
     VELOX_FAIL("The dropped memory pool {} not found", pool->name());
   }
   pools_.erase(it);
-  VELOX_DCHECK_EQ(pool->currentBytes(), 0);
-  arbitrator_->shrinkCapacity(pool, 0);
 }
 
 MemoryPool& MemoryManager::deprecatedSharedLeafPool() {
   const auto idx = std::hash<std::thread::id>{}(std::this_thread::get_id());
-  folly::SharedMutex::ReadHolder guard{mutex_};
   return *sharedLeafPools_.at(idx % sharedLeafPools_.size());
 }
 
@@ -252,10 +339,9 @@ int64_t MemoryManager::getTotalBytes() const {
 }
 
 size_t MemoryManager::numPools() const {
-  size_t numPools = defaultRoot_->getChildCount();
-  VELOX_CHECK_GE(numPools, 0);
+  size_t numPools = sysRoot_->getChildCount();
   {
-    folly::SharedMutex::ReadHolder guard{mutex_};
+    std::shared_lock guard{mutex_};
     numPools += pools_.size() - sharedLeafPools_.size();
   }
   return numPools;
@@ -280,14 +366,14 @@ std::string MemoryManager::toString(bool detail) const {
       << "\n";
   out << "List of root pools:\n";
   if (detail) {
-    out << defaultRoot_->treeMemoryUsage();
+    out << sysRoot_->treeMemoryUsage(false);
   } else {
-    out << "\t" << defaultRoot_->name() << "\n";
+    out << "\t" << sysRoot_->name() << "\n";
   }
   std::vector<std::shared_ptr<MemoryPool>> pools = getAlivePools();
   for (const auto& pool : pools) {
     if (detail) {
-      out << pool->treeMemoryUsage();
+      out << pool->treeMemoryUsage(false);
     } else {
       out << "\t" << pool->name() << "\n";
     }
@@ -301,7 +387,7 @@ std::string MemoryManager::toString(bool detail) const {
 
 std::vector<std::shared_ptr<MemoryPool>> MemoryManager::getAlivePools() const {
   std::vector<std::shared_ptr<MemoryPool>> pools;
-  folly::SharedMutex::ReadHolder guard{mutex_};
+  std::shared_lock guard{mutex_};
   pools.reserve(pools_.size());
   for (const auto& entry : pools_) {
     auto pool = entry.second.lock();
@@ -341,5 +427,9 @@ memory::MemoryPool* spillMemoryPool() {
 
 bool isSpillMemoryPool(memory::MemoryPool* pool) {
   return pool == spillMemoryPool();
+}
+
+memory::MemoryPool* traceMemoryPool() {
+  return memory::MemoryManager::getInstance()->tracePool();
 }
 } // namespace facebook::velox::memory

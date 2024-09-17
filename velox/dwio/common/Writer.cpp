@@ -17,6 +17,7 @@
 #include "velox/dwio/common/Writer.h"
 
 namespace facebook::velox::dwio::common {
+
 void Writer::checkStateTransition(State oldState, State newState) {
   switch (oldState) {
     case State::kInit:
@@ -36,7 +37,10 @@ void Writer::checkStateTransition(State oldState, State newState) {
     default:
       break;
   }
-  VELOX_FAIL("Unexpected state transition from {} to {}", oldState, newState);
+  VELOX_FAIL(
+      "Unexpected state transition from {} to {}",
+      Writer::stateString(oldState),
+      Writer::stateString(newState));
 }
 
 std::string Writer::stateString(State state) {
@@ -59,11 +63,16 @@ bool Writer::isRunning() const {
 }
 
 void Writer::checkRunning() const {
-  VELOX_CHECK_EQ(state_, State::kRunning, "Writer is not running: {}", state_);
+  VELOX_CHECK_EQ(
+      static_cast<int>(state_),
+      static_cast<int>(State::kRunning),
+      "Writer is not running: {}",
+      Writer::stateString(state_));
 }
 
 void Writer::setState(State state) {
   checkStateTransition(state_, state);
   state_ = state;
 }
+
 } // namespace facebook::velox::dwio::common

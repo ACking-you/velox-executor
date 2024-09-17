@@ -44,23 +44,7 @@ class ScanSpec {
   static constexpr const char* kMapValuesFieldName = "values";
   static constexpr const char* kArrayElementsFieldName = "elements";
 
-  explicit ScanSpec(const Subfield::PathElement& element) {
-    if (element.kind() == kNestedField) {
-      auto field = reinterpret_cast<const Subfield::NestedField*>(&element);
-      fieldName_ = field->name();
-
-    } else {
-      VELOX_CHECK(false, "Only nested fields are supported");
-    }
-  }
-
   explicit ScanSpec(const std::string& name) : fieldName_(name) {}
-
-  ScanSpec(const ScanSpec& other) {
-    *this = other;
-  }
-
-  ScanSpec& operator=(const ScanSpec&);
 
   // Filter to apply. If 'this' corresponds to a struct/list/map, this
   // can only be isNull or isNotNull, other filtering is given by
@@ -202,6 +186,10 @@ class ScanSpec {
   // each level of struct is mandatory.
   uint64_t newRead();
 
+  /// Returns the ScanSpec corresponding to 'name'. Creates it if needed without
+  /// any intermediate level.
+  ScanSpec* getOrCreateChild(const std::string& name);
+
   // Returns the ScanSpec corresponding to 'subfield'. Creates it if
   // needed, including any intermediate levels. This is used at
   // TableScan initialization to create the ScanSpec tree that
@@ -216,10 +204,6 @@ class ScanSpec {
     return it->second;
   }
 
-  // Remove a child from this scan spec, returning the removed child.  This is
-  // used for example to transform a flatmap scan spec into a struct scan spec.
-  std::shared_ptr<ScanSpec> removeChild(const ScanSpec* child);
-
   SelectivityInfo& selectivity() {
     return selectivity_;
   }
@@ -232,9 +216,11 @@ class ScanSpec {
     valueHook_ = valueHook;
   }
 
-  // Returns true if the corresponding reader only needs to reference
-  // the nulls stream. True if filter is is-null with or without value
-  // extraction or if filter is is-not-null and no value is extracted.
+  // Returns true if the corresponding reader only needs to reference the nulls
+  // stream.  True if filter is is-null with or without value extraction or if
+  // filter is is-not-null and no value is extracted.  Note that this does not
+  // apply to Nimble format leaf nodes, because nulls are mixed in the encoding
+  // with actual values.
   bool readsNullsOnly() const {
     if (filter_) {
       if (filter_->kind() == FilterKind::kIsNull) {
@@ -262,6 +248,12 @@ class ScanSpec {
   //
   // This may change as a result of runtime adaptation.
   bool hasFilter() const;
+
+  /// Assume this field is read as null constant vector (usually due to missing
+  /// field), check if any filter in the struct subtree would make the whole
+  /// vector to be filtered out.  Return false when the whole vector should be
+  /// filtered out.
+  bool testNull() const;
 
   // Resets cached values after this or children were updated, e.g. a new filter
   // was added or existing filter was modified.
@@ -324,6 +316,26 @@ class ScanSpec {
   // projected out.
   void addAllChildFields(const Type&);
 
+  const std::vector<std::string>& flatMapFeatureSelection() const {
+    return flatMapFeatureSelection_;
+  }
+
+  void setFlatMapFeatureSelection(std::vector<std::string> features) {
+    flatMapFeatureSelection_ = std::move(features);
+  }
+
+  /// Invoke the function provided on each node of the ScanSpec tree.
+  template <typename F>
+  void visit(const Type& type, F&& f);
+
+  bool isFlatMapAsStruct() const {
+    return isFlatMapAsStruct_;
+  }
+
+  void setFlatMapAsStruct(bool value) {
+    isFlatMapAsStruct_ = value;
+  }
+
  private:
   void reorder();
 
@@ -354,7 +366,7 @@ class ScanSpec {
   // True if a string dictionary or flat map in this field should be
   // returned as flat.
   bool makeFlat_ = false;
-  std::shared_ptr<common::Filter> filter_;
+  std::unique_ptr<common::Filter> filter_;
 
   // Filters that will be only used for row group filtering based on metadata.
   // The conjunctions among these filters are tracked in MetadataFilter, with
@@ -400,7 +412,43 @@ class ScanSpec {
   // Only take the first maxArrayElementsCount_ elements from each array.
   vector_size_t maxArrayElementsCount_ =
       std::numeric_limits<vector_size_t>::max();
+
+  // Used only for bulk reader to project flat map features.
+  std::vector<std::string> flatMapFeatureSelection_;
+
+  // This node represents a flat map column that need to be read as struct,
+  // i.e. in table schema it is a MAP, but in result vector it is ROW.
+  bool isFlatMapAsStruct_ = false;
 };
+
+template <typename F>
+void ScanSpec::visit(const Type& type, F&& f) {
+  f(type, *this);
+  if (isConstant()) {
+    // Child specs are not populated in this case.
+    return;
+  }
+  switch (type.kind()) {
+    case TypeKind::ROW:
+      for (auto& child : children_) {
+        VELOX_CHECK_NE(child->channel(), kNoChannel);
+        child->visit(*type.childAt(child->channel()), std::forward<F>(f));
+      }
+      break;
+    case TypeKind::MAP:
+      childByName(kMapKeysFieldName)
+          ->visit(*type.childAt(0), std::forward<F>(f));
+      childByName(kMapValuesFieldName)
+          ->visit(*type.childAt(1), std::forward<F>(f));
+      break;
+    case TypeKind::ARRAY:
+      childByName(kArrayElementsFieldName)
+          ->visit(*type.childAt(0), std::forward<F>(f));
+      break;
+    default:
+      break;
+  }
+}
 
 // Returns false if no value from a range defined by stats can pass the
 // filter. True, otherwise.

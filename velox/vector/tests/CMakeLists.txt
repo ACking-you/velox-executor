@@ -15,24 +15,26 @@ add_subdirectory(utils)
 
 add_executable(
   velox_vector_test
-  VectorCompareTest.cpp
-  VectorSaverTest.cpp
-  VectorMakerTest.cpp
-  VectorPoolTest.cpp
-  VectorPrinterTest.cpp
-  VectorTest.cpp
-  VectorStreamTest.cpp
-  VectorToStringTest.cpp
-  VectorEstimateFlatSizeTest.cpp
-  VectorPrepareForReuseTest.cpp
+  CopyPreserveEncodingsTest.cpp
   DecodedVectorTest.cpp
-  SelectivityVectorTest.cpp
+  EncodingTest.cpp
   EnsureWritableVectorTest.cpp
   IsWritableVectorTest.cpp
   LazyVectorTest.cpp
   MayHaveNullsRecursiveTest.cpp
+  SelectivityVectorTest.cpp
   VariantToVectorTest.cpp
-  VectorTestUtils.cpp)
+  VectorCompareTest.cpp
+  VectorEstimateFlatSizeTest.cpp
+  VectorMakerTest.cpp
+  VectorPoolTest.cpp
+  VectorPrepareForReuseTest.cpp
+  VectorPrinterTest.cpp
+  VectorSaverTest.cpp
+  VectorStreamTest.cpp
+  VectorTest.cpp
+  VectorTestUtils.cpp
+  VectorToStringTest.cpp)
 
 add_test(velox_vector_test velox_vector_test)
 
@@ -55,8 +57,8 @@ target_link_libraries(
   Boost::regex
   Boost::thread
   Boost::system
-  gtest
-  gtest_main
+  GTest::gtest
+  GTest::gtest_main
   Folly::folly
   gflags::gflags
   glog::glog
@@ -73,8 +75,8 @@ target_link_libraries(
   velox_buffer
   velox_type
   velox_vector_test_lib
-  gtest
-  gtest_main
+  GTest::gtest
+  GTest::gtest_main
   Folly::folly
   gflags::gflags
   glog::glog
@@ -88,8 +90,8 @@ target_link_libraries(
   bias_vector_test
   velox_vector
   Boost::filesystem
-  gtest
-  gtest_main
+  GTest::gtest
+  GTest::gtest_main
   Folly::folly
   gflags::gflags
   glog::glog

@@ -97,10 +97,10 @@ Generic Configuration
      - The maximum size in bytes for the task's buffered output when output is partitioned using hash of partitioning keys. See PartitionedOutputNode::Kind::kPartitioned.
        The producer Drivers are blocked when the buffered size exceeds this.
        The Drivers are resumed when the buffered size goes below OutputBufferManager::kContinuePct (90)% of this.
-   * - max_arbitrary_buffer_size
+   * - max_output_buffer_size
      - integer
      - 32MB
-     - The maximum size in bytes for the task's buffered output when output is distributed randomly among consumers. See PartitionedOutputNode::Kind::kArbitrary.
+     - The maximum size in bytes for the task's buffered output.
        The producer Drivers are blocked when the buffered size exceeds this.
        The Drivers are resumed when the buffered size goes below OutputBufferManager::kContinuePct (90)% of this.
    * - min_table_rows_for_parallel_join_build
@@ -129,6 +129,14 @@ Generic Configuration
      - 0
      - If it is not zero, specifies the time limit that a driver can continuously
        run on a thread before yield. If it is zero, then it no limit.
+   * - prefixsort_normalized_key_max_bytes
+     - integer
+     - 128
+     - Maximum number of bytes to use for the normalized key in prefix-sort. Use 0 to disable prefix-sort.
+   * - prefixsort_min_rows
+     - integer
+     - 130
+     - Minimum number of rows to use prefix-sort. The default value has been derived using micro-benchmarking.
 
 .. _expression-evaluation-conf:
 
@@ -160,25 +168,22 @@ Expression Evaluation Configuration
      - bool
      - false
      - This flag makes the Row conversion to by applied in a way that the casting row field are matched by name instead of position.
-   * - cast_to_int_by_truncate
+   * - debug_disable_expression_with_peeling
      - bool
      - false
-     - This flags forces the cast from float/double/decimal/string to integer to be performed by truncating the decimal part instead of rounding.
-   * - cast_string_to_date_is_iso_8601
+     - Disable optimization in expression evaluation to peel common dictionary layer from inputs. Should only be used for debugging.
+   * - debug_disable_common_sub_expressions
      - bool
-     - true
-     - If set, cast from string to date allows only ISO 8601 formatted strings: ``[+-](YYYY-MM-DD)``.
-       Otherwise, allows all patterns supported by Spark:
-         * ``[+-]yyyy*``
-         * ``[+-]yyyy*-[m]m``
-         * ``[+-]yyyy*-[m]m-[d]d``
-         * ``[+-]yyyy*-[m]m-[d]d *``
-         * ``[+-]yyyy*-[m]m-[d]dT*``
-       The asterisk ``*`` in ``yyyy*`` stands for any numbers.
-       For the last two patterns, the trailing ``*`` can represent none or any sequence of characters, e.g:
-         * "1970-01-01 123"
-         * "1970-01-01 (BC)"
-       Regardless of this setting's value, leading spaces will be trimmed.
+     - false
+     - Disable optimization in expression evaluation to re-use cached results for common sub-expressions. Should only be used for debugging.
+   * - debug_disable_expression_with_memoization
+     - bool
+     - false
+     - Disable optimization in expression evaluation to re-use cached results between subsequent input batches that are dictionary encoded and have the same alphabet(underlying flat vector). Should only be used for debugging.
+   * - debug_disable_expression_with_lazy_inputs
+     - bool
+     - false
+     - Disable optimization in expression evaluation to delay loading of lazy inputs unless required. Should only be used for debugging.
 
 Memory Management
 -----------------
@@ -284,7 +289,7 @@ Spilling
        reservation grows along a series of powers of (1 + N / 100). If the memory reservation fails, it starts spilling.
    * - max_spill_level
      - integer
-     - 4
+     - 1
      - The maximum allowed spilling level with zero being the initial spilling level. Applies to hash join build
        spilling which might use recursive spilling when the build table is very large. -1 means unlimited.
        In this case an extremely large query might run out of spilling partition bits. The max spill level
@@ -314,6 +319,11 @@ Spilling
      - 4MB
      - The maximum size in bytes to buffer the serialized spill data before write to disk for IO efficiency.
        If set to zero, buffering is disabled.
+   * - spill_read_buffer_size
+     - integer
+     - 1MB
+     - The buffer size in bytes to read from one spilled file. If the underlying filesystem supports async
+       read, we do read-ahead with double buffering, which doubles the buffer used to read from each spill file.
    * - min_spill_run_size
      - integer
      - 256MB
@@ -332,9 +342,9 @@ Spilling
      - integer
      - 29
      - The start partition bit which is used with `spiller_partition_bits` together to calculate the spilling partition number.
-   * - join_spiller_partition_bits
+   * - spiller_num_partition_bits
      - integer
-     - 2
+     - 3
      - The number of bits (N) used to calculate the spilling partition number for hash join and RowNumber: 2 ^ N. At the moment the maximum
        value is 3, meaning we only support up to 8-way spill partitioning.ing.
    * - testing.spill_pct
@@ -376,29 +386,6 @@ Table Writer
      - task_writer_count
      - The number of parallel table writer threads per task for bucketed table writes. If not set, use 'task_writer_count' as default.
 
-Codegen Configuration
----------------------
-.. list-table::
-   :widths: 20 10 10 70
-   :header-rows: 1
-
-   * - Property Name
-     - Type
-     - Default Value
-     - Description
-   * - codegen.enabled
-     - boolean
-     - false
-     - Along with `codegen.configuration_file_path` enables codegen in task execution path.
-   * - codegen.configuration_file_path
-     - string
-     -
-     - A path to the file contaning codegen options.
-   * - codegen.lazy_loading
-     - boolean
-     - true
-     - Triggers codegen initialization tests upon loading if false. Otherwise skips them.
-
 Hive Connector
 --------------
 Hive Connector config is initialized on velox runtime startup and is shared among queries as the default config.
@@ -438,6 +425,24 @@ Each query can override the config by setting corresponding query session proper
      - false
      - True if reading the source file column names as lower case, and planner should guarantee
        the input column name and filter is also lower case to achive case-insensitive read.
+   * - partition_path_as_lower_case
+     -
+     - bool
+     - true
+     - If true, the partition directory will be converted to lowercase when executing a table write operation.
+   * - allow-null-partition-keys
+     - allow_null_partition_keys
+     - bool
+     - true
+     - Determines whether null values for partition keys are allowed or not. If not, fails with "Partition key must
+       not be null" error message when writing data with null partition key.
+       Null check for partitioning key should be used only when partitions are generated dynamically during query execution.
+       For queries that write to fixed partitions, this check should happen much earlier before the Velox execution even starts.
+   * - ignore_missing_files
+     -
+     - bool
+     - false
+     - If true, splits that refer to missing files don't generate errors and are processed as empty splits.
    * - max-coalesced-bytes
      -
      - integer
@@ -479,13 +484,13 @@ Each query can override the config by setting corresponding query session proper
      -
      - integer
      - 8MB
-     - Usually Velox fetches the meta data firstly then fetch the rest of file. But if the file is very small, Velox can fetch the whole file directly to avoid multiple IO requests. 
-       The parameter controls the threshold when whole file is fetched. 
+     - Usually Velox fetches the meta data firstly then fetch the rest of file. But if the file is very small, Velox can fetch the whole file directly to avoid multiple IO requests.
+       The parameter controls the threshold when whole file is fetched.
    * - footer-estimated-size
      -
      - integer
      - 1MB
-     - Define the estimation of footer size in ORC and Parquet format. The footer data includes version, schema, and meta data for every columns which may or may not need to be fetched later. 
+     - Define the estimation of footer size in ORC and Parquet format. The footer data includes version, schema, and meta data for every columns which may or may not need to be fetched later.
        The parameter controls the size when footer is fetched each time. Bigger value can decrease the IO requests but may fetch more useless meta data.
    * - hive.orc.writer.stripe-max-size
      - orc_optimized_writer_max_stripe_size
@@ -497,6 +502,46 @@ Each query can override the config by setting corresponding query session proper
      - string
      - 16M
      - Maximum dictionary memory that can be used in orc writer.
+   * - hive.orc.writer.integer-dictionary-encoding-enabled
+     - orc_optimized_writer_integer_dictionary_encoding_enabled
+     - bool
+     - true
+     - Whether or not dictionary encoding of integer types should be used by the ORC writer.
+   * - hive.orc.writer.string-dictionary-encoding-enabled
+     - orc_optimized_writer_string_dictionary_encoding_enabled
+     - bool
+     - true
+     - Whether or not dictionary encoding of string types should be used by the ORC writer.
+   * - hive.parquet.writer.timestamp-unit
+     - hive.parquet.writer.timestamp_unit
+     - tinyint
+     - 9
+     - Timestamp unit used when writing timestamps into Parquet through Arrow bridge.
+       Valid values are 0 (second), 3 (millisecond), 6 (microsecond), 9 (nanosecond).
+   * - hive.orc.writer.linear-stripe-size-heuristics
+     - orc_writer_linear_stripe_size_heuristics
+     - bool
+     - true
+     - Enables historical based stripe size estimation after compression.
+   * - hive.orc.writer.min-compression-size
+     - orc_writer_min_compression_size
+     - integer
+     - 1024
+     - Minimal number of items in an encoded stream.
+   * - hive.orc.writer.compression-level
+     - orc_optimized_writer_compression_level
+     - tinyint
+     - 3 for ZSTD and 4 for ZLIB
+     - The compression level to use with ZLIB and ZSTD.
+   * - cache.no_retention
+     - cache.no_retention
+     - bool
+     - false
+     - If true, evict out a query scanned data out of in-memory cache right after the access,
+       and also skip staging to the ssd cache. This helps to prevent the cache space pollution
+       from the one-time table scan by large batch query when mixed running with interactive
+       query which has high data locality.
+
 
 ``Amazon S3 Configuration``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -510,7 +555,7 @@ Each query can override the config by setting corresponding query session proper
      - Description
    * - hive.s3.use-instance-credentials
      - bool
-     - true
+     - false
      - Use the EC2 metadata service to retrieve API credentials. This works with IAM roles in EC2.
    * - hive.s3.aws-access-key
      - string
@@ -546,7 +591,34 @@ Each query can override the config by setting corresponding query session proper
      - string
      - velox-session
      - Session name associated with the IAM role.
-
+   * - hive.s3.use-proxy-from-env
+     - bool
+     - false
+     - Utilize the configuration of the environment variables http_proxy, https_proxy, and no_proxy for use with the S3 API.
+   * - hive.s3.connect-timeout
+     - string
+     -
+     - Socket connect timeout.
+   * - hive.s3.socket-timeout
+     - string
+     -
+     - Socket read timeout.
+   * - hive.s3.max-connections
+     - integer
+     -
+     - Maximum concurrent TCP connections for a single http client.
+   * - hive.s3.max-attempts
+     - integer
+     -
+     - Maximum attempts for connections to a single http client, work together with retry-mode. By default, it's 3 for standard/adaptive mode
+       and 10 for legacy mode.
+   * - hive.s3.retry-mode
+     - string
+     -
+     - **Allowed values:** "standard", "adaptive", "legacy". By default it's empty, S3 client will be created with RetryStrategy.
+       Legacy mode only enables throttled retry for transient errors.
+       Standard mode is built on top of legacy mode and has throttled retry enabled for throttling errors apart from transient errors.
+       Adaptive retry mode dynamically limits the rate of AWS requests to maximize success rate.
 ``Google Cloud Storage Configuration``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 .. list-table::
@@ -569,6 +641,14 @@ Each query can override the config by setting corresponding query session proper
      - string
      -
      - The GCS service account configuration as json string.
+   * - hive.gcs.max-retry-count
+     - integer
+     -
+     - The GCS maximum retry counter of transient errors.
+   * - hive.gcs.max-retry-time
+     - string
+     -
+     - The GCS maximum time allowed to retry transient errors.
 
 ``Azure Blob Storage Configuration``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -629,3 +709,31 @@ Spark-specific Configuration
      - 4194304
      - The maximum number of bits to use for the bloom filter in :spark:func:`bloom_filter_agg` function,
        the value of this config can not exceed the default value.
+   * - spark.partition_id
+     - integer
+     -
+     - The current task's Spark partition ID. It's set by the query engine (Spark) prior to task execution.
+
+Tracing
+--------
+.. list-table::
+   :widths: 30 10 10 70
+   :header-rows: 1
+
+   * - Property Name
+     - Type
+     - Default Value
+     - Description
+   * - query_trace_enabled
+     - bool
+     - true
+     - If true, enable query tracing.
+   * - query_trace_dir
+     - string
+     -
+     - The root directory to store the tracing data and metadata for a query.
+   * - query_trace_node_ids
+     - string
+     -
+     - A comma-separated list of plan node ids whose input data will be trace. If it is empty, then we only trace the
+       query metadata which includes the query plan and configs etc.

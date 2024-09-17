@@ -16,6 +16,7 @@
 
 #include "velox/dwio/parquet/reader/PageReader.h"
 
+#include "velox/common/testutil/TestValue.h"
 #include "velox/dwio/common/BufferUtil.h"
 #include "velox/dwio/common/ColumnVisitors.h"
 #include "velox/dwio/parquet/thrift/ThriftTransport.h"
@@ -23,10 +24,17 @@
 
 #include <thrift/protocol/TCompactProtocol.h> // @manual
 
+using facebook::velox::common::testutil::TestValue;
+
 namespace facebook::velox::parquet {
 
 using thrift::Encoding;
 using thrift::PageHeader;
+
+struct __attribute__((__packed__)) Int96Timestamp {
+  int32_t days;
+  uint64_t nanos;
+};
 
 void PageReader::seekToPage(int64_t row) {
   defineDecoder_.reset();
@@ -73,6 +81,8 @@ void PageReader::seekToPage(int64_t row) {
 }
 
 PageHeader PageReader::readPageHeader() {
+  TestValue::adjust(
+      "facebook::velox::parquet::PageReader::readPageHeader", this);
   if (bufferEnd_ == bufferStart_) {
     const void* buffer;
     int32_t size;
@@ -118,37 +128,7 @@ const char* PageReader::readBytes(int32_t size, BufferPtr& copy) {
   return copy->as<char>();
 }
 
-common::CompressionKind PageReader::thriftCodecToCompressionKind() {
-  switch (codec_) {
-    case thrift::CompressionCodec::UNCOMPRESSED:
-      return common::CompressionKind::CompressionKind_NONE;
-      break;
-    case thrift::CompressionCodec::SNAPPY:
-      return common::CompressionKind::CompressionKind_SNAPPY;
-      break;
-    case thrift::CompressionCodec::GZIP:
-      return common::CompressionKind::CompressionKind_GZIP;
-      break;
-    case thrift::CompressionCodec::LZO:
-      return common::CompressionKind::CompressionKind_LZO;
-      break;
-    case thrift::CompressionCodec::LZ4:
-      return common::CompressionKind::CompressionKind_LZ4;
-      break;
-    case thrift::CompressionCodec::ZSTD:
-      return common::CompressionKind::CompressionKind_ZSTD;
-      break;
-    case thrift::CompressionCodec::LZ4_RAW:
-      return common::CompressionKind::CompressionKind_LZ4;
-    default:
-      VELOX_UNSUPPORTED(
-          "Unsupported compression type: " +
-          facebook::velox::parquet::thrift::to_string(codec_));
-      break;
-  }
-}
-
-const char* FOLLY_NONNULL PageReader::decompressData(
+const char* PageReader::decompressData(
     const char* pageData,
     uint32_t compressedSize,
     uint32_t uncompressedSize) {
@@ -159,11 +139,11 @@ const char* FOLLY_NONNULL PageReader::decompressData(
       fmt::format("Page Reader: Stream {}", inputStream_->getName());
   std::unique_ptr<dwio::common::SeekableInputStream> decompressedStream =
       dwio::common::compression::createDecompressor(
-          thriftCodecToCompressionKind(),
+          codec_,
           std::move(inputStream),
           uncompressedSize,
           pool_,
-          getParquetDecompressionOptions(thriftCodecToCompressionKind()),
+          getParquetDecompressionOptions(codec_),
           streamDebugInfo,
           nullptr,
           true,
@@ -291,12 +271,11 @@ void PageReader::prepareDataPageV2(const PageHeader& pageHeader, int64_t row) {
     return;
   }
 
-  uint32_t defineLength = maxDefine_ > 0
-      ? pageHeader.data_page_header_v2.definition_levels_byte_length
-      : 0;
-  uint32_t repeatLength = maxRepeat_ > 0
-      ? pageHeader.data_page_header_v2.repetition_levels_byte_length
-      : 0;
+  uint32_t defineLength =
+      pageHeader.data_page_header_v2.definition_levels_byte_length;
+  uint32_t repeatLength =
+      pageHeader.data_page_header_v2.repetition_levels_byte_length;
+
   auto bytes = pageHeader.compressed_page_size;
   pageData_ = readBytes(bytes, pageBuffer_);
 
@@ -315,8 +294,9 @@ void PageReader::prepareDataPageV2(const PageHeader& pageHeader, int64_t row) {
   }
   auto levelsSize = repeatLength + defineLength;
   pageData_ += levelsSize;
-  if (pageHeader.data_page_header_v2.__isset.is_compressed ||
-      pageHeader.data_page_header_v2.is_compressed) {
+  if (pageHeader.data_page_header_v2.__isset.is_compressed &&
+      pageHeader.data_page_header_v2.is_compressed &&
+      (pageHeader.compressed_page_size - levelsSize > 0)) {
     pageData_ = decompressData(
         pageData_,
         pageHeader.compressed_page_size - levelsSize,
@@ -346,7 +326,7 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
       dictionaryEncoding_ == Encoding::PLAIN_DICTIONARY ||
       dictionaryEncoding_ == Encoding::PLAIN);
 
-  if (codec_ != thrift::CompressionCodec::UNCOMPRESSED) {
+  if (codec_ != common::CompressionKind::CompressionKind_NONE) {
     pageData_ = readBytes(pageHeader.compressed_page_size, pageBuffer_);
     pageData_ = decompressData(
         pageData_,
@@ -393,6 +373,42 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
           // We start from the end to allow in-place expansion.
           values[i] = parquetValues[i];
         }
+      }
+      break;
+    }
+    case thrift::Type::INT96: {
+      auto numVeloxBytes = dictionary_.numValues * sizeof(Timestamp);
+      dictionary_.values = AlignedBuffer::allocate<char>(numVeloxBytes, &pool_);
+      auto numBytes = dictionary_.numValues * sizeof(Int96Timestamp);
+      if (pageData_) {
+        memcpy(dictionary_.values->asMutable<char>(), pageData_, numBytes);
+      } else {
+        dwio::common::readBytes(
+            numBytes,
+            inputStream_.get(),
+            dictionary_.values->asMutable<char>(),
+            bufferStart_,
+            bufferEnd_);
+      }
+      // Expand the Parquet type length values to Velox type length.
+      // We start from the end to allow in-place expansion.
+      auto values = dictionary_.values->asMutable<Timestamp>();
+      auto parquetValues = dictionary_.values->asMutable<char>();
+
+      for (auto i = dictionary_.numValues - 1; i >= 0; --i) {
+        // Convert the timestamp into seconds and nanos since the Unix epoch,
+        // 00:00:00.000000 on 1 January 1970.
+        int64_t nanos;
+        memcpy(
+            &nanos,
+            parquetValues + i * sizeof(Int96Timestamp),
+            sizeof(int64_t));
+        int32_t days;
+        memcpy(
+            &days,
+            parquetValues + i * sizeof(Int96Timestamp) + sizeof(int64_t),
+            sizeof(int32_t));
+        values[i] = Timestamp::fromDaysAndNanos(days, nanos);
       }
       break;
     }
@@ -486,7 +502,6 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
       VELOX_UNSUPPORTED(
           "Parquet type {} not supported for dictionary", parquetType);
     }
-    case thrift::Type::INT96:
     default:
       VELOX_UNSUPPORTED(
           "Parquet type {} not supported for dictionary", parquetType);
@@ -513,6 +528,8 @@ int32_t parquetTypeBytes(thrift::Type::type type) {
     case thrift::Type::INT64:
     case thrift::Type::DOUBLE:
       return 8;
+    case thrift::Type::INT96:
+      return 12;
     default:
       VELOX_FAIL("Type does not have a byte width {}", type);
   }
@@ -649,12 +666,18 @@ void PageReader::makeDecoder() {
               pageData_, pageData_ + encodedDataSize_);
           break;
         case thrift::Type::FIXED_LEN_BYTE_ARRAY:
-          directDecoder_ = std::make_unique<dwio::common::DirectDecoder<true>>(
-              std::make_unique<dwio::common::SeekableArrayInputStream>(
-                  pageData_, encodedDataSize_),
-              false,
-              type_->typeLength_,
-              true);
+          if (type_->type()->isVarbinary() || type_->type()->isVarchar()) {
+            stringDecoder_ = std::make_unique<StringDecoder>(
+                pageData_, pageData_ + encodedDataSize_, type_->typeLength_);
+          } else {
+            directDecoder_ =
+                std::make_unique<dwio::common::DirectDecoder<true>>(
+                    std::make_unique<dwio::common::SeekableArrayInputStream>(
+                        pageData_, encodedDataSize_),
+                    false,
+                    type_->typeLength_,
+                    true);
+          }
           break;
         default: {
           directDecoder_ = std::make_unique<dwio::common::DirectDecoder<true>>(

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/RowNumber.h"
+#include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/exec/OperatorUtils.h"
 
 namespace facebook::velox::exec {
@@ -64,6 +65,10 @@ RowNumber::RowNumber(
     resultProjections_.emplace_back(0, inputType->size());
     results_.resize(1);
   }
+
+  if (spillEnabled()) {
+    setSpillPartitionBits();
+  }
 }
 
 void RowNumber::addInput(RowVectorPtr input) {
@@ -78,8 +83,9 @@ void RowNumber::addInput(RowVectorPtr input) {
     }
 
     SelectivityVector rows(numInput);
-    table_->prepareForGroupProbe(*lookup_, input, rows, false);
-    table_->groupProbe(*lookup_);
+    table_->prepareForGroupProbe(
+        *lookup_, input, rows, BaseHashTable::kNoSpillInputStartPartitionBit);
+    table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
 
     // Initialize new partitions with zeros.
     for (auto i : lookup_->newGroups) {
@@ -91,17 +97,26 @@ void RowNumber::addInput(RowVectorPtr input) {
 }
 
 void RowNumber::addSpillInput() {
+  VELOX_CHECK_NOT_NULL(input_);
+  ensureInputFits(input_);
+  if (input_ == nullptr) {
+    // Memory arbitration might be triggered by ensureInputFits() which will
+    // spill 'input_'.
+    return;
+  }
+
   const auto numInput = input_->size();
   SelectivityVector rows(numInput);
-  table_->prepareForGroupProbe(*lookup_, input_, rows, false);
-  table_->groupProbe(*lookup_);
+
+  VELOX_CHECK(spillConfig_.has_value());
+  table_->prepareForGroupProbe(
+      *lookup_, input_, rows, spillConfig_->startPartitionBit);
+  table_->groupProbe(*lookup_, spillConfig_->startPartitionBit);
 
   // Initialize new partitions with zeros.
   for (auto i : lookup_->newGroups) {
     setNumRows(lookup_->hits[i], 0);
   }
-
-  // TODO Add support for recursive spilling.
 }
 
 void RowNumber::noMoreInput() {
@@ -109,20 +124,7 @@ void RowNumber::noMoreInput() {
 
   if (inputSpiller_ != nullptr) {
     inputSpiller_->finishSpill(spillInputPartitionSet_);
-
-    recordSpillStats(hashTableSpiller_->stats());
-    recordSpillStats(inputSpiller_->stats());
-
-    // Remove empty partitions.
-    auto it = spillInputPartitionSet_.begin();
-    while (it != spillInputPartitionSet_.end()) {
-      if (it->second->numFiles() > 0) {
-        ++it;
-      } else {
-        it = spillInputPartitionSet_.erase(it);
-      }
-    }
-
+    removeEmptyPartitions(spillInputPartitionSet_);
     restoreNextSpillPartition();
   }
 }
@@ -133,12 +135,16 @@ void RowNumber::restoreNextSpillPartition() {
   }
 
   auto it = spillInputPartitionSet_.begin();
-  spillInputReader_ = it->second->createUnorderedReader(pool());
+  spillInputReader_ = it->second->createUnorderedReader(
+      spillConfig_->readBufferSize, pool(), &spillStats_);
 
   // Find matching partition for the hash table.
   auto hashTableIt = spillHashTablePartitionSet_.find(it->first);
   if (hashTableIt != spillHashTablePartitionSet_.end()) {
-    spillHashTableReader_ = hashTableIt->second->createUnorderedReader(pool());
+    spillHashTableReader_ = hashTableIt->second->createUnorderedReader(
+        spillConfig_->readBufferSize, pool(), &spillStats_);
+
+    setSpillPartitionBits(&(it->first));
 
     RowVectorPtr data;
     while (spillHashTableReader_->nextBatch(data)) {
@@ -157,8 +163,9 @@ void RowNumber::restoreNextSpillPartition() {
 
       const auto numInput = input->size();
       SelectivityVector rows(numInput);
-      table_->prepareForGroupProbe(*lookup_, input, rows, false);
-      table_->groupProbe(*lookup_);
+      table_->prepareForGroupProbe(
+          *lookup_, input, rows, spillConfig_->startPartitionBit);
+      table_->groupProbe(*lookup_, spillConfig_->startPartitionBit);
 
       auto* counts = data->children().back()->as<FlatVector<int64_t>>();
 
@@ -172,6 +179,8 @@ void RowNumber::restoreNextSpillPartition() {
   spillInputPartitionSet_.erase(it);
 
   spillInputReader_->nextBatch(input_);
+  VELOX_CHECK_NOT_NULL(input_);
+  // NOTE: spillInputReader_ will at least produce one batch output.
   addSpillInput();
 }
 
@@ -199,12 +208,13 @@ void RowNumber::ensureInputFits(const RowVectorPtr& input) {
   const auto outOfLineBytesPerRow = outOfLineBytes / numDistinct;
 
   // Test-only spill path.
-  if (spillConfig_->testSpillPct > 0) {
-    spill();
+  if (testingTriggerSpill(pool()->name())) {
+    Operator::ReclaimableSectionGuard guard(this);
+    memory::testingRunArbitration(pool());
     return;
   }
 
-  const auto currentUsage = pool()->currentBytes();
+  const auto currentUsage = pool()->usedBytes();
   const auto minReservationBytes =
       currentUsage * spillConfig_->minSpillableReservationPct / 100;
   const auto availableReservationBytes = pool()->availableReservation();
@@ -238,7 +248,7 @@ void RowNumber::ensureInputFits(const RowVectorPtr& input) {
 
   LOG(WARNING) << "Failed to reserve " << succinctBytes(targetIncrementBytes)
                << " for memory pool " << pool()->name()
-               << ", usage: " << succinctBytes(pool()->currentBytes())
+               << ", usage: " << succinctBytes(pool()->usedBytes())
                << ", reservation: " << succinctBytes(pool()->reservedBytes());
 }
 
@@ -254,7 +264,19 @@ FlatVector<int64_t>& RowNumber::getOrCreateRowNumberVector(vector_size_t size) {
 
 RowVectorPtr RowNumber::getOutput() {
   if (input_ == nullptr) {
-    return nullptr;
+    if (spillInputReader_ == nullptr) {
+      return nullptr;
+    }
+
+    recursiveSpillInput();
+    if (yield_) {
+      yield_ = false;
+      return nullptr;
+    }
+
+    if (input_ == nullptr) {
+      return nullptr;
+    }
   }
 
   if (!table_) {
@@ -314,6 +336,7 @@ RowVectorPtr RowNumber::getOutput() {
     } else {
       input_ = nullptr;
       spillInputReader_ = nullptr;
+      table_->clear();
       restoreNextSpillPartition();
     }
   } else {
@@ -370,45 +393,56 @@ void RowNumber::reclaim(
     return;
   }
 
-  if (hashTableSpiller_) {
-    // Already spilled.
+  if (exceededMaxSpillLevelLimit_) {
+    LOG(WARNING) << "Exceeded row spill level limit: "
+                 << spillConfig_->maxSpillLevel
+                 << ", and abandon spilling for memory pool: "
+                 << pool()->name();
+    ++spillStats_.wlock()->spillMaxLevelExceededCount;
     return;
   }
 
   spill();
 }
 
-void RowNumber::setupHashTableSpiller() {
+SpillPartitionNumSet RowNumber::spillHashTable() {
   // TODO Replace joinPartitionBits and Spiller::Type::kHashJoinBuild.
-
-  const auto& spillConfig = spillConfig_.value();
-  HashBitRange hashBits(
-      spillConfig.startPartitionBit,
-      spillConfig.startPartitionBit + spillConfig.joinPartitionBits);
+  VELOX_CHECK_NOT_NULL(table_);
 
   auto columnTypes = table_->rows()->columnTypes();
   auto tableType = ROW(std::move(columnTypes));
+  const auto& spillConfig = spillConfig_.value();
 
-  hashTableSpiller_ = std::make_unique<Spiller>(
-      Spiller::Type::kHashJoinBuild,
+  auto hashTableSpiller = std::make_unique<Spiller>(
+      Spiller::Type::kRowNumber,
       table_->rows(),
       tableType,
-      std::move(hashBits),
+      spillPartitionBits_,
       &spillConfig,
-      spillConfig.maxFileSize);
+      &spillStats_);
+
+  hashTableSpiller->spill();
+  hashTableSpiller->finishSpill(spillHashTablePartitionSet_);
+
+  table_->clear();
+  pool()->release();
+  return hashTableSpiller->state().spilledPartitionSet();
 }
 
-void RowNumber::setupInputSpiller() {
+void RowNumber::setupInputSpiller(
+    const SpillPartitionNumSet& spillPartitionSet) {
+  VELOX_CHECK(!spillPartitionSet.empty());
+
   const auto& spillConfig = spillConfig_.value();
-  const auto& hashBits = hashTableSpiller_->hashBits();
 
   // TODO Replace Spiller::Type::kHashJoinProbe.
   inputSpiller_ = std::make_unique<Spiller>(
       Spiller::Type::kHashJoinProbe,
       inputType_,
-      hashBits,
+      spillPartitionBits_,
       &spillConfig,
-      spillConfig.maxFileSize);
+      &spillStats_);
+  inputSpiller_->setPartitionsSpilled(spillPartitionSet);
 
   const auto& hashers = table_->hashers();
 
@@ -424,21 +458,11 @@ void RowNumber::setupInputSpiller() {
 
 void RowNumber::spill() {
   VELOX_CHECK(spillEnabled());
-  VELOX_CHECK_NULL(hashTableSpiller_);
-  VELOX_CHECK_NULL(inputSpiller_);
 
-  setupHashTableSpiller();
-  setupInputSpiller();
+  const auto spillPartitionSet = spillHashTable();
+  VELOX_CHECK_EQ(table_->numDistinct(), 0);
 
-  hashTableSpiller_->spill();
-  hashTableSpiller_->finishSpill(spillHashTablePartitionSet_);
-
-  table_->clear();
-  pool()->release();
-
-  inputSpiller_->setPartitionsSpilled(
-      hashTableSpiller_->state().spilledPartitionSet());
-
+  setupInputSpiller(spillPartitionSet);
   if (input_ != nullptr) {
     spillInput(input_, memory::spillMemoryPool());
     input_ = nullptr;
@@ -486,6 +510,41 @@ void RowNumber::spillInput(
     inputSpiller_->spill(
         partition, wrap(numInputs, partitionIndices[partition], input));
   }
+}
+
+void RowNumber::recursiveSpillInput() {
+  RowVectorPtr input;
+  while (spillInputReader_->nextBatch(input)) {
+    spillInput(input, pool());
+
+    if (operatorCtx_->driver()->shouldYield()) {
+      yield_ = true;
+      return;
+    }
+  }
+
+  inputSpiller_->finishSpill(spillInputPartitionSet_);
+  spillInputReader_ = nullptr;
+
+  removeEmptyPartitions(spillInputPartitionSet_);
+  restoreNextSpillPartition();
+}
+
+void RowNumber::setSpillPartitionBits(
+    const SpillPartitionId* restoredPartitionId) {
+  const auto startPartitionBitOffset = restoredPartitionId == nullptr
+      ? spillConfig_->startPartitionBit
+      : restoredPartitionId->partitionBitOffset() +
+          spillConfig_->numPartitionBits;
+  if (spillConfig_->exceedSpillLevelLimit(startPartitionBitOffset)) {
+    exceededMaxSpillLevelLimit_ = true;
+    return;
+  }
+
+  exceededMaxSpillLevelLimit_ = false;
+  spillPartitionBits_ = HashBitRange(
+      startPartitionBitOffset,
+      startPartitionBitOffset + spillConfig_->numPartitionBits);
 }
 
 } // namespace facebook::velox::exec

@@ -40,8 +40,9 @@ class PageReader {
       std::unique_ptr<dwio::common::SeekableInputStream> stream,
       memory::MemoryPool& pool,
       ParquetTypeWithIdPtr fileType,
-      thrift::CompressionCodec::type codec,
-      int64_t chunkSize)
+      common::CompressionKind codec,
+      int64_t chunkSize,
+      const tz::TimeZone* sessionTimezone)
       : pool_(pool),
         inputStream_(std::move(stream)),
         type_(std::move(fileType)),
@@ -50,7 +51,8 @@ class PageReader {
         isTopLevel_(maxRepeat_ == 0 && maxDefine_ <= 1),
         codec_(codec),
         chunkSize_(chunkSize),
-        nullConcatenation_(pool_) {
+        nullConcatenation_(pool_),
+        sessionTimezone_(sessionTimezone) {
     type_->makeLevelInfo(leafInfo_);
   }
 
@@ -58,8 +60,9 @@ class PageReader {
   PageReader(
       std::unique_ptr<dwio::common::SeekableInputStream> stream,
       memory::MemoryPool& pool,
-      thrift::CompressionCodec::type codec,
-      int64_t chunkSize)
+      common::CompressionKind codec,
+      int64_t chunkSize,
+      const tz::TimeZone* sessionTimezone = nullptr)
       : pool_(pool),
         inputStream_(std::move(stream)),
         maxRepeat_(0),
@@ -67,7 +70,8 @@ class PageReader {
         isTopLevel_(maxRepeat_ == 0 && maxDefine_ <= 1),
         codec_(codec),
         chunkSize_(chunkSize),
-        nullConcatenation_(pool_) {}
+        nullConcatenation_(pool_),
+        sessionTimezone_(sessionTimezone) {}
 
   /// Advances 'numRows' top level rows.
   void skip(int64_t numRows);
@@ -88,8 +92,8 @@ class PageReader {
       int32_t begin,
       int32_t end,
       int32_t maxItems,
-      int32_t* FOLLY_NULLABLE lengths,
-      uint64_t* FOLLY_NULLABLE nulls,
+      int32_t* lengths,
+      uint64_t* nulls,
       int32_t nullsStartIndex) const;
 
   /// Applies 'visitor' to values in the ColumnChunk of 'this'. The
@@ -137,6 +141,10 @@ class PageReader {
   // bufferEnd_ to the corresponding positions.
   thrift::PageHeader readPageHeader();
 
+  const tz::TimeZone* sessionTimezone() const {
+    return sessionTimezone_;
+  }
+
  private:
   // Indicates that we only want the repdefs for the next page. Used when
   // prereading repdefs with seekToPage.
@@ -148,7 +156,7 @@ class PageReader {
 
   // If the current page has nulls, returns a nulls bitmap owned by 'this'. This
   // is filled for 'numRows' bits.
-  const uint64_t* FOLLY_NULLABLE readNulls(int32_t numRows, BufferPtr& buffer);
+  const uint64_t* readNulls(int32_t numRows, BufferPtr& buffer);
 
   // Skips the define decoder, if any, for 'numValues' top level
   // rows. Returns the number of non-nulls skipped. The range is the
@@ -201,15 +209,13 @@ class PageReader {
   // Returns a pointer to contiguous space for the next 'size' bytes
   // from current position. Copies data into 'copy' if the range
   // straddles buffers. Allocates or resizes 'copy' as needed.
-  const char* FOLLY_NONNULL readBytes(int32_t size, BufferPtr& copy);
-
-  common::CompressionKind thriftCodecToCompressionKind();
+  const char* readBytes(int32_t size, BufferPtr& copy);
 
   // Decompresses data starting at 'pageData_', consuming 'compressedsize' and
   // producing up to 'uncompressedSize' bytes. The start of the decoding
   // result is returned. an intermediate copy may be made in 'decompresseddata_'
-  const char* FOLLY_NONNULL decompressData(
-      const char* FOLLY_NONNULL pageData,
+  const char* decompressData(
+      const char* pageData,
       uint32_t compressedSize,
       uint32_t uncompressedSize);
 
@@ -257,10 +263,8 @@ class PageReader {
           !std::is_same_v<typename Visitor::DataType, folly::StringPiece> &&
               !std::is_same_v<typename Visitor::DataType, int8_t>,
           int>::type = 0>
-  void callDecoder(
-      const uint64_t* FOLLY_NULLABLE nulls,
-      bool& nullsFromFastPath,
-      Visitor visitor) {
+  void
+  callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
     if (nulls) {
       nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor) &&
           (!this->type_->type()->isLongDecimal()) &&
@@ -294,10 +298,8 @@ class PageReader {
       typename std::enable_if<
           std::is_same_v<typename Visitor::DataType, folly::StringPiece>,
           int>::type = 0>
-  void callDecoder(
-      const uint64_t* FOLLY_NULLABLE nulls,
-      bool& nullsFromFastPath,
-      Visitor visitor) {
+  void
+  callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
     if (nulls) {
       if (isDictionary()) {
         nullsFromFastPath = dwio::common::useFastPath<Visitor, true>(visitor);
@@ -322,10 +324,8 @@ class PageReader {
       typename std::enable_if<
           std::is_same_v<typename Visitor::DataType, int8_t>,
           int>::type = 0>
-  void callDecoder(
-      const uint64_t* FOLLY_NULLABLE nulls,
-      bool& nullsFromFastPath,
-      Visitor visitor) {
+  void
+  callDecoder(const uint64_t* nulls, bool& nullsFromFastPath, Visitor visitor) {
     VELOX_CHECK(!isDictionary(), "BOOLEAN types are never dictionary-encoded")
     if (nulls) {
       nullsFromFastPath = false;
@@ -356,10 +356,10 @@ class PageReader {
   const int32_t maxDefine_;
   const bool isTopLevel_;
 
-  const thrift::CompressionCodec::type codec_;
+  const common::CompressionKind codec_;
   const int64_t chunkSize_;
-  const char* FOLLY_NULLABLE bufferStart_{nullptr};
-  const char* FOLLY_NULLABLE bufferEnd_{nullptr};
+  const char* bufferStart_{nullptr};
+  const char* bufferEnd_{nullptr};
   BufferPtr tempNulls_;
   BufferPtr nullsInReadRange_;
   BufferPtr multiPageNulls_;
@@ -424,7 +424,7 @@ class PageReader {
 
   // First byte of decompressed encoded data. Contains the encoded data as a
   // contiguous run of bytes.
-  const char* FOLLY_NULLABLE pageData_{nullptr};
+  const char* pageData_{nullptr};
 
   // Dictionary contents.
   dwio::common::DictionaryValues dictionary_;
@@ -442,7 +442,7 @@ class PageReader {
   // Below members Keep state between calls to readWithVisitor().
 
   // Original rows in Visitor.
-  const vector_size_t* FOLLY_NULLABLE visitorRows_{nullptr};
+  const vector_size_t* visitorRows_{nullptr};
   int32_t numVisitorRows_{0};
 
   // 'rowOfPage_' at the start of readWithVisitor().
@@ -462,7 +462,7 @@ class PageReader {
 
   //  Temporary for rewriting rows to access in readWithVisitor when moving
   //  between pages. Initialized from the visitor.
-  raw_vector<vector_size_t>* FOLLY_NULLABLE rowsCopy_{nullptr};
+  raw_vector<vector_size_t>* rowsCopy_{nullptr};
 
   // If 'rowsCopy_' is used, this is the difference between the rows in
   // 'rowsCopy_' and the row numbers in 'rows' given to readWithVisitor().
@@ -480,6 +480,8 @@ class PageReader {
 
   // Base values of dictionary when reading a string dictionary.
   VectorPtr dictionaryValues_;
+
+  const tz::TimeZone* sessionTimezone_{nullptr};
 
   // Decoders. Only one will be set at a time.
   std::unique_ptr<dwio::common::DirectDecoder<true>> directDecoder_;
@@ -527,6 +529,13 @@ void PageReader::readWithVisitor(Visitor& visitor) {
     visitor.setNumValuesBias(numValuesBeforePage);
     visitor.setRows(pageRows);
     callDecoder(nulls, nullsFromFastPath, visitor);
+    if (encoding_ == thrift::Encoding::DELTA_BINARY_PACKED &&
+        deltaBpDecoder_->validValuesCount() == 0) {
+      VELOX_DCHECK(
+          deltaBpDecoder_->bufferStart() == pageData_ + encodedDataSize_,
+          "Once all data in the delta binary packed decoder has been read, "
+          "its buffer ptr should be moved to the end of the page.");
+    }
     if (currentVisitorRow_ < numVisitorRows_ || isMultiPage) {
       if (mayProduceNulls) {
         if (!isMultiPage) {

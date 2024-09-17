@@ -18,10 +18,13 @@
 #include <arrow/c/bridge.h>
 #include <arrow/io/interfaces.h>
 #include <arrow/table.h>
+#include "velox/common/base/Pointers.h"
+#include "velox/common/config/Config.h"
+#include "velox/common/testutil/TestValue.h"
+#include "velox/core/QueryConfig.h"
 #include "velox/dwio/parquet/writer/arrow/Properties.h"
 #include "velox/dwio/parquet/writer/arrow/Writer.h"
 #include "velox/exec/MemoryReclaimer.h"
-#include "velox/vector/arrow/Bridge.h"
 
 namespace facebook::velox::parquet {
 
@@ -131,13 +134,19 @@ std::shared_ptr<WriterProperties> getArrowParquetWriterOptions(
   if (!options.enableDictionary) {
     properties = properties->disable_dictionary();
   }
-  properties =
-      properties->compression(getArrowParquetCompression(options.compression));
+  properties = properties->compression(getArrowParquetCompression(
+      options.compressionKind.value_or(common::CompressionKind_NONE)));
+  for (const auto& columnCompressionValues : options.columnCompressionsMap) {
+    properties->compression(
+        columnCompressionValues.first,
+        getArrowParquetCompression(columnCompressionValues.second));
+  }
   properties = properties->encoding(options.encoding);
   properties = properties->data_pagesize(options.dataPageSize);
   properties = properties->max_row_group_length(
       static_cast<int64_t>(flushPolicy->rowsInRowGroup()));
   properties = properties->codec_options(options.codecOptions);
+  properties = properties->enable_store_decimal_as_integer();
   return properties->build();
 }
 
@@ -169,7 +178,7 @@ std::shared_ptr<::arrow::Field> updateFieldNameRecursive(
     const Type& type,
     const std::string& name = "") {
   if (type.isRow()) {
-    auto rowType = type.asRow();
+    auto& rowType = type.asRow();
     auto newField = field->WithName(name);
     auto structType =
         std::dynamic_pointer_cast<::arrow::StructType>(newField->type());
@@ -225,13 +234,17 @@ Writer::Writer(
   validateSchemaRecursive(schema_);
 
   if (options.flushPolicyFactory) {
-    flushPolicy_ = options.flushPolicyFactory();
+    castUniquePointer(options.flushPolicyFactory(), flushPolicy_);
   } else {
     flushPolicy_ = std::make_unique<DefaultFlushPolicy>();
   }
+  options_.timestampUnit =
+      options.parquetWriteTimestampUnit.value_or(TimestampUnit::kNano);
+  options_.timestampTimeZone = options.parquetWriteTimestampTimeZone;
   arrowContext_->properties =
       getArrowParquetWriterOptions(options, flushPolicy_);
   setMemoryReclaimers();
+  writeInt96AsTimestamp_ = options.writeInt96AsTimestamp;
 }
 
 Writer::Writer(
@@ -249,7 +262,11 @@ Writer::Writer(
 void Writer::flush() {
   if (arrowContext_->stagingRows > 0) {
     if (!arrowContext_->writer) {
-      auto arrowProperties = ArrowWriterProperties::Builder().build();
+      ArrowWriterProperties::Builder builder;
+      if (writeInt96AsTimestamp_) {
+        builder.enable_deprecated_int96_timestamps();
+      }
+      auto arrowProperties = builder.build();
       PARQUET_ASSIGN_OR_THROW(
           arrowContext_->writer,
           FileWriter::Open(
@@ -305,15 +322,16 @@ void Writer::write(const VectorPtr& data) {
       data->type()->equivalent(*schema_),
       "The file schema type should be equal with the input rowvector type.");
 
-  ArrowOptions options{.flattenDictionary = true, .flattenConstant = true};
   ArrowArray array;
   ArrowSchema schema;
-  exportToArrow(data, array, generalPool_.get(), options);
-  exportToArrow(data, schema, options);
+  exportToArrow(data, array, generalPool_.get(), options_);
+  exportToArrow(data, schema, options_);
 
   // Convert the arrow schema to Schema and then update the column names based
   // on schema_.
   auto arrowSchema = ::arrow::ImportSchema(&schema).ValueOrDie();
+  common::testutil::TestValue::adjust(
+      "facebook::velox::parquet::Writer::write", arrowSchema.get());
   std::vector<std::shared_ptr<::arrow::Field>> newFields;
   auto childSize = schema_->size();
   for (auto i = 0; i < childSize; i++) {
@@ -374,16 +392,6 @@ void Writer::abort() {
   arrowContext_.reset();
 }
 
-parquet::WriterOptions getParquetOptions(
-    const dwio::common::WriterOptions& options) {
-  parquet::WriterOptions parquetOptions;
-  parquetOptions.memoryPool = options.memoryPool;
-  if (options.compressionKind.has_value()) {
-    parquetOptions.compression = options.compressionKind.value();
-  }
-  return parquetOptions;
-}
-
 void Writer::setMemoryReclaimers() {
   VELOX_CHECK(
       !pool_->isLeaf(),
@@ -403,10 +411,19 @@ void Writer::setMemoryReclaimers() {
 
 std::unique_ptr<dwio::common::Writer> ParquetWriterFactory::createWriter(
     std::unique_ptr<dwio::common::FileSink> sink,
-    const dwio::common::WriterOptions& options) {
-  auto parquetOptions = getParquetOptions(options);
+    const std::shared_ptr<dwio::common::WriterOptions>& options) {
+  auto parquetOptions =
+      std::dynamic_pointer_cast<parquet::WriterOptions>(options);
+  VELOX_CHECK_NOT_NULL(
+      parquetOptions,
+      "Parquet writer factory expected a Parquet WriterOptions object.");
   return std::make_unique<Writer>(
-      std::move(sink), parquetOptions, asRowType(options.schema));
+      std::move(sink), *parquetOptions, asRowType(options->schema));
+}
+
+std::unique_ptr<dwio::common::WriterOptions>
+ParquetWriterFactory::createWriterOptions() {
+  return std::make_unique<parquet::WriterOptions>();
 }
 
 } // namespace facebook::velox::parquet

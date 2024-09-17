@@ -23,22 +23,12 @@ namespace {
 void recordInvalidStartIndex(vector_size_t row, exec::EvalCtx& context) {
   try {
     VELOX_USER_FAIL("SQL array indices start at 1. Got 0.");
-  } catch (const VeloxUserError& exception) {
+  } catch (const VeloxUserError&) {
     context.setVeloxExceptionError(row, std::current_exception());
   }
 }
 
 class FindFirstFunctionBase : public exec::VectorFunction {
- public:
-  bool isDefaultNullBehavior() const override {
-    // find_first function is null preserving for the array argument, but
-    // predicate expression may use other fields and may not preserve nulls in
-    // these.
-    // For example: find_first(array[1, 2, 3], x -> x > coalesce(a, 0)) should
-    // not return null when 'a' is null.
-    return false;
-  }
-
  protected:
   ArrayVectorPtr prepareInputArray(
       const VectorPtr& input,
@@ -108,7 +98,7 @@ class FindFirstFunctionBase : public exec::VectorFunction {
       auto wrapCapture = toWrapCapture<ArrayVector>(
           numElements, entry.callable, *entry.rows, flatArray);
 
-      ErrorVectorPtr elementErrors;
+      exec::EvalErrorsPtr elementErrors;
       entry.callable->applyNoThrow(
           elementRows,
           nullptr, // No need to preserve any values in 'matchBits'.
@@ -224,17 +214,6 @@ class FindFirstFunctionBase : public exec::VectorFunction {
     return elementRows;
   }
 
-  static FOLLY_ALWAYS_INLINE std::optional<std::exception_ptr> getOptionalError(
-      const ErrorVectorPtr& errors,
-      vector_size_t row) {
-    if (errors && row < errors->size() && !errors->isNullAt(row)) {
-      return *std::static_pointer_cast<std::exception_ptr>(
-          errors->valueAt(row));
-    }
-
-    return std::nullopt;
-  }
-
   // Returns an index of the first matching element or std::nullopt if no
   // element matches or there was an error evaluating the predicate.
   //
@@ -245,15 +224,16 @@ class FindFirstFunctionBase : public exec::VectorFunction {
       vector_size_t arrayRow,
       vector_size_t offset,
       vector_size_t size,
-      const ErrorVectorPtr& elementErrors,
+      const exec::EvalErrorsPtr& elementErrors,
       const exec::LocalDecodedVector& matchDecoder) const {
     const auto step = size > 0 ? 1 : -1;
-    for (auto i = offset; i != offset + size; i += step) {
-      auto index = i;
-      if (auto error = getOptionalError(elementErrors, index)) {
-        // Report first error to match Presto's implementation.
-        context.setError(arrayRow, error.value());
-        return std::nullopt;
+    for (auto index = offset; index != offset + size; index += step) {
+      if (elementErrors) {
+        if (auto error = elementErrors->errorAt(index)) {
+          // Report first error to match Presto's implementation.
+          context.setError(arrayRow, *error.value());
+          return std::nullopt;
+        }
       }
 
       if (!matchDecoder->isNullAt(index) &&
@@ -322,7 +302,7 @@ class FindFirstFunction : public FindFirstFunctionBase {
           if (flatArray->elements()->isNullAt(firstMatchingIndex)) {
             try {
               VELOX_USER_FAIL("find_first found NULL as the first match");
-            } catch (const VeloxUserError& exception) {
+            } catch (const VeloxUserError&) {
               context.setVeloxExceptionError(row, std::current_exception());
             }
           } else {
@@ -416,6 +396,12 @@ std::vector<std::shared_ptr<exec::FunctionSignature>> indexSignatures() {
 }
 
 } // namespace
+
+/// find_first function is null preserving for the array argument, but
+/// predicate expression may use other fields and may not preserve nulls in
+/// these.
+/// For example: find_first(array[1, 2, 3], x -> x > coalesce(a, 0)) should
+/// not return null when 'a' is null.
 
 VELOX_DECLARE_VECTOR_FUNCTION(
     udf_find_first,

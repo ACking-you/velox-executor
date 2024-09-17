@@ -26,11 +26,15 @@ namespace facebook::velox::aggregate::test {
 
 namespace {
 
+constexpr int64_t kLongMax = std::numeric_limits<int64_t>::max();
+constexpr int64_t kLongMin = std::numeric_limits<int64_t>::min();
+constexpr int128_t kHugeMax = std::numeric_limits<int128_t>::max();
+constexpr int128_t kHugeMin = std::numeric_limits<int128_t>::min();
+
 class SetAggTest : public AggregationTestBase {
  protected:
   void SetUp() override {
     AggregationTestBase::SetUp();
-    allowInputShuffle();
   }
 };
 
@@ -153,6 +157,184 @@ TEST_F(SetAggTest, groupBy) {
       {"set_agg(c1)"},
       {"c0", "array_sort(a0)"},
       {expected});
+}
+
+TEST_F(SetAggTest, shortDecimal) {
+  // Test with short decimal
+  auto type = DECIMAL(6, 2);
+
+  auto data = makeRowVector({
+      makeFlatVector<int64_t>(
+          {kLongMin,
+           2000,
+           3000,
+           -4321,
+           kLongMax,
+           5000,
+           3000,
+           kLongMax,
+           -2000,
+           6000,
+           7000},
+          type),
+  });
+
+  auto expected = makeRowVector({
+      makeArrayVector<int64_t>(
+          {
+              {kLongMin, -4321, -2000, 2000, 3000, 5000, 6000, 7000, kLongMax},
+          },
+          type),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+
+  // Test with some NULL inputs (short decimals)
+  data = makeRowVector({
+      makeNullableFlatVector<int64_t>(
+          {1000,
+           std::nullopt,
+           kLongMin,
+           4000,
+           std::nullopt,
+           4000,
+           std::nullopt,
+           -1000,
+           5000,
+           -9999,
+           kLongMax},
+          type),
+  });
+
+  expected = makeRowVector({
+      makeNullableArrayVector(
+          std::vector<std::vector<std::optional<int64_t>>>{
+              {kLongMin,
+               -9999,
+               -1000,
+               1000,
+               4000,
+               5000,
+               kLongMax,
+               std::nullopt}},
+          ARRAY(type)),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+
+  // Test with all NULL inputs (short decimals)
+  data = makeRowVector({
+      makeNullableFlatVector<int64_t>(
+          {std::nullopt,
+           std::nullopt,
+           std::nullopt,
+           std::nullopt,
+           std::nullopt},
+          type),
+  });
+
+  expected = makeRowVector({
+      makeNullableArrayVector(
+          std::vector<std::vector<std::optional<int64_t>>>{{std::nullopt}},
+          ARRAY(type)),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+}
+
+TEST_F(SetAggTest, longDecimal) {
+  // Test with long decimal
+  auto type = DECIMAL(20, 2);
+
+  auto data = makeRowVector({
+      makeFlatVector<int128_t>(
+          {kHugeMin,
+           -2000,
+           3000,
+           4000,
+           5000,
+           kHugeMax,
+           -9630,
+           2000,
+           6000,
+           7000},
+          type),
+  });
+
+  auto expected = makeRowVector({
+      makeArrayVector<int128_t>(
+          {
+              {kHugeMin,
+               -9630,
+               -2000,
+               2000,
+               3000,
+               4000,
+               5000,
+               6000,
+               7000,
+               kHugeMax},
+          },
+          type),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+
+  // Test with some NULL inputs (long decimals)
+  data = makeRowVector({
+      makeNullableFlatVector<int128_t>(
+          {1000,
+           std::nullopt,
+           3000,
+           4000,
+           std::nullopt,
+           kHugeMax,
+           -8424,
+           4000,
+           std::nullopt,
+           -1000,
+           5000,
+           kHugeMin,
+           2000},
+          type),
+  });
+
+  expected = makeRowVector({
+      makeNullableArrayVector(
+          std::vector<std::vector<std::optional<int128_t>>>{
+              {kHugeMin,
+               -8424,
+               -1000,
+               1000,
+               2000,
+               3000,
+               4000,
+               5000,
+               kHugeMax,
+               std::nullopt}},
+          ARRAY(type)),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+
+  // Test with all NULL inputs (long decimals)
+  data = makeRowVector({
+      makeNullableFlatVector<int128_t>(
+          {std::nullopt,
+           std::nullopt,
+           std::nullopt,
+           std::nullopt,
+           std::nullopt},
+          type),
+  });
+
+  expected = makeRowVector({
+      makeNullableArrayVector(
+          std::vector<std::vector<std::optional<int128_t>>>{{std::nullopt}},
+          ARRAY(type)),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
 }
 
 std::vector<std::optional<std::string>> generateStrings(
@@ -508,6 +690,93 @@ TEST_F(SetAggTest, inputOrder) {
                   .planNode();
 
   assertQuery(plan, expected);
+}
+
+TEST_F(SetAggTest, nans) {
+  // Verify that NaNs with different binary representations are considered equal
+  // and deduplicated.
+  static const auto kNaN = std::numeric_limits<double>::quiet_NaN();
+  static const auto kSNaN = std::numeric_limits<double>::signaling_NaN();
+
+  // Global aggregation, Primitive type.
+  auto data = makeRowVector({
+      makeFlatVector<double>({1, 2, kNaN, 3, 4, kSNaN, 2, 4, kNaN}),
+      makeFlatVector<int32_t>({1, 1, 1, 2, 2, 2, 2, 2, 2}),
+  });
+
+  auto expected = makeRowVector({
+      makeArrayVector<double>({
+          {1, 2, 3, 4, kNaN},
+      }),
+  });
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+
+  // Group by aggregation, Primitive type.
+  expected = makeRowVector({
+      makeArrayVector<double>({
+          {1, 2, kNaN},
+          {2, 3, 4, kNaN},
+      }),
+      makeFlatVector<int32_t>({1, 2}),
+  });
+
+  testAggregations(
+      {data}, {"c1"}, {"set_agg(c0)"}, {"array_sort(a0)", "c1"}, {expected});
+
+  // Global aggregation, Complex type key (ROW(String, Double)).
+  // Input Type:  Row(Row(string, double), int)
+  data = makeRowVector({
+      makeRowVector({
+          makeFlatVector<StringView>({
+              "a"_sv,
+              "b"_sv,
+              "c"_sv,
+              "a"_sv,
+              "b"_sv,
+              "c"_sv,
+              "a"_sv,
+              "b"_sv,
+              "c"_sv,
+          }),
+          makeFlatVector<double>({1, 2, kNaN, 1, 2, kSNaN, 1, 2, kNaN}),
+      }),
+      makeFlatVector<int32_t>({1, 1, 1, 2, 2, 2, 2, 2, 2}),
+  });
+
+  // Output Type:  Row(Array(Row(string, double)), int)
+  expected = makeRowVector({makeArrayVector(
+      {0},
+      makeRowVector(
+          {makeFlatVector<StringView>({
+               "a"_sv,
+               "b"_sv,
+               "c"_sv,
+           }),
+           makeFlatVector<double>({1, 2, kNaN})}))});
+
+  testAggregations({data}, {}, {"set_agg(c0)"}, {"array_sort(a0)"}, {expected});
+
+  // Group by aggregation, Complex type.
+  // Ouput Type:  Row(Array(Row(string, double)), int)
+  expected = makeRowVector({
+      makeArrayVector(
+          {0, 3},
+          makeRowVector(
+              {makeFlatVector<StringView>({
+                   "a"_sv,
+                   "b"_sv,
+                   "c"_sv,
+                   "a"_sv,
+                   "b"_sv,
+                   "c"_sv,
+               }),
+               makeFlatVector<double>({1, 2, kNaN, 1, 2, kNaN})})),
+      makeFlatVector<int32_t>({1, 2}),
+  });
+
+  testAggregations(
+      {data}, {"c1"}, {"set_agg(c0)"}, {"array_sort(a0)", "c1"}, {expected});
 }
 
 } // namespace

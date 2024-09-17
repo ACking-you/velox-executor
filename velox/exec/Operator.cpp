@@ -53,18 +53,25 @@ OperatorCtx::createConnectorQueryCtx(
     const std::string& planNodeId,
     memory::MemoryPool* connectorPool,
     const common::SpillConfig* spillConfig) const {
-  return std::make_shared<connector::ConnectorQueryCtx>(
+  const auto& task = driverCtx_->task;
+  auto connectorQueryCtx = std::make_shared<connector::ConnectorQueryCtx>(
       pool_,
       connectorPool,
-      driverCtx_->task->queryCtx()->connectorSessionProperties(connectorId),
+      task->queryCtx()->connectorSessionProperties(connectorId),
       spillConfig,
+      driverCtx_->prefixSortConfig(),
       std::make_unique<SimpleExpressionEvaluator>(
           execCtx()->queryCtx(), execCtx()->pool()),
-      driverCtx_->task->queryCtx()->cache(),
-      driverCtx_->task->queryCtx()->queryId(),
+      task->queryCtx()->cache(),
+      task->queryCtx()->queryId(),
       taskId(),
       planNodeId,
-      driverCtx_->driverId);
+      driverCtx_->driverId,
+      driverCtx_->queryConfig().sessionTimezone(),
+      task->getCancellationToken());
+  connectorQueryCtx->setSelectiveNimbleReaderEnabled(
+      driverCtx_->queryConfig().selectiveNimbleReaderEnabled());
+  return connectorQueryCtx;
 }
 
 Operator::Operator(
@@ -140,10 +147,9 @@ std::unique_ptr<JoinBridge> Operator::joinBridgeFromPlanNode(
 void Operator::initialize() {
   VELOX_CHECK(!initialized_);
   VELOX_CHECK_EQ(
-      pool()->currentBytes(),
+      pool()->usedBytes(),
       0,
-      "Unexpected memory usage {} from pool {} before operator init",
-      succinctBytes(pool()->currentBytes()),
+      "Unexpected memory usage from pool {} before operator init",
       pool()->name());
   initialized_ = true;
   maybeSetReclaimer();
@@ -254,28 +260,23 @@ OperatorStats Operator::stats(bool clear) {
   return stats;
 }
 
-uint32_t Operator::outputBatchRows(
+vector_size_t Operator::outputBatchRows(
     std::optional<uint64_t> averageRowSize) const {
   const auto& queryConfig = operatorCtx_->task()->queryCtx()->queryConfig();
-
   if (!averageRowSize.has_value()) {
     return queryConfig.preferredOutputBatchRows();
   }
 
-  const uint64_t rowSize = averageRowSize.value();
-  VELOX_CHECK_GE(
-      rowSize,
-      0,
-      "The given average row size of {}.{} is negative.",
-      operatorType(),
-      operatorId());
-
-  if (rowSize * queryConfig.maxOutputBatchRows() <
-      queryConfig.preferredOutputBatchBytes()) {
+  if (averageRowSize.value() == 0) {
     return queryConfig.maxOutputBatchRows();
   }
-  return std::max<uint32_t>(
-      queryConfig.preferredOutputBatchBytes() / rowSize, 1);
+
+  const uint64_t batchSize =
+      queryConfig.preferredOutputBatchBytes() / averageRowSize.value();
+  if (batchSize > queryConfig.maxOutputBatchRows()) {
+    return queryConfig.maxOutputBatchRows();
+  }
+  return std::max<vector_size_t>(batchSize, 1);
 }
 
 void Operator::recordBlockingTime(uint64_t start, BlockingReason reason) {
@@ -295,91 +296,106 @@ void Operator::recordBlockingTime(uint64_t start, BlockingReason reason) {
       fmt::format("blocked{}Times", blockReason), RuntimeCounter(1));
 }
 
-void Operator::recordSpillStats(const common::SpillStats& spillStats) {
-  VELOX_CHECK(noMoreInput_);
+void Operator::recordSpillStats() {
+  const auto lockedSpillStats = spillStats_.wlock();
   auto lockedStats = stats_.wlock();
-  lockedStats->spilledInputBytes += spillStats.spilledInputBytes;
-  lockedStats->spilledBytes += spillStats.spilledBytes;
-  lockedStats->spilledRows += spillStats.spilledRows;
-  lockedStats->spilledPartitions += spillStats.spilledPartitions;
-  lockedStats->spilledFiles += spillStats.spilledFiles;
-  if (spillStats.spillFillTimeUs != 0) {
+  lockedStats->spilledInputBytes += lockedSpillStats->spilledInputBytes;
+  lockedStats->spilledBytes += lockedSpillStats->spilledBytes;
+  lockedStats->spilledRows += lockedSpillStats->spilledRows;
+  lockedStats->spilledPartitions += lockedSpillStats->spilledPartitions;
+  lockedStats->spilledFiles += lockedSpillStats->spilledFiles;
+  if (lockedSpillStats->spillFillTimeNanos != 0) {
     lockedStats->addRuntimeStat(
-        "spillFillTime",
+        kSpillFillTime,
         RuntimeCounter{
-            static_cast<int64_t>(
-                spillStats.spillFillTimeUs *
-                Timestamp::kNanosecondsInMicrosecond),
+            static_cast<int64_t>(lockedSpillStats->spillFillTimeNanos),
             RuntimeCounter::Unit::kNanos});
   }
-  if (spillStats.spillSortTimeUs != 0) {
+  if (lockedSpillStats->spillSortTimeNanos != 0) {
     lockedStats->addRuntimeStat(
-        "spillSortTime",
+        kSpillSortTime,
         RuntimeCounter{
-            static_cast<int64_t>(
-                spillStats.spillSortTimeUs *
-                Timestamp::kNanosecondsInMicrosecond),
+            static_cast<int64_t>(lockedSpillStats->spillSortTimeNanos),
             RuntimeCounter::Unit::kNanos});
   }
-  if (spillStats.spillSerializationTimeUs != 0) {
+  if (lockedSpillStats->spillSerializationTimeNanos != 0) {
     lockedStats->addRuntimeStat(
-        "spillSerializationTime",
+        kSpillSerializationTime,
         RuntimeCounter{
-            static_cast<int64_t>(
-                spillStats.spillSerializationTimeUs *
-                Timestamp::kNanosecondsInMicrosecond),
+            static_cast<int64_t>(lockedSpillStats->spillSerializationTimeNanos),
             RuntimeCounter::Unit::kNanos});
   }
-  if (spillStats.spillFlushTimeUs != 0) {
+  if (lockedSpillStats->spillFlushTimeNanos != 0) {
     lockedStats->addRuntimeStat(
-        "spillFlushTime",
+        kSpillFlushTime,
         RuntimeCounter{
-            static_cast<int64_t>(
-                spillStats.spillFlushTimeUs *
-                Timestamp::kNanosecondsInMicrosecond),
+            static_cast<int64_t>(lockedSpillStats->spillFlushTimeNanos),
             RuntimeCounter::Unit::kNanos});
   }
-  if (spillStats.spillDiskWrites != 0) {
+  if (lockedSpillStats->spillWrites != 0) {
     lockedStats->addRuntimeStat(
-        "spillDiskWrites",
-        RuntimeCounter{static_cast<int64_t>(spillStats.spillDiskWrites)});
+        kSpillWrites,
+        RuntimeCounter{static_cast<int64_t>(lockedSpillStats->spillWrites)});
   }
-  if (spillStats.spillWriteTimeUs != 0) {
+  if (lockedSpillStats->spillWriteTimeNanos != 0) {
     lockedStats->addRuntimeStat(
-        "spillWriteTime",
+        kSpillWriteTime,
         RuntimeCounter{
-            static_cast<int64_t>(
-                spillStats.spillWriteTimeUs *
-                Timestamp::kNanosecondsInMicrosecond),
+            static_cast<int64_t>(lockedSpillStats->spillWriteTimeNanos),
             RuntimeCounter::Unit::kNanos});
   }
-  if (spillStats.spillRuns != 0) {
+  if (lockedSpillStats->spillRuns != 0) {
     lockedStats->addRuntimeStat(
-        "spillRuns",
-        RuntimeCounter{static_cast<int64_t>(spillStats.spillRuns)});
-    common::updateGlobalSpillRunStats(spillStats.spillRuns);
+        kSpillRuns,
+        RuntimeCounter{static_cast<int64_t>(lockedSpillStats->spillRuns)});
+    common::updateGlobalSpillRunStats(lockedSpillStats->spillRuns);
   }
 
-  if (spillStats.spillMaxLevelExceededCount != 0) {
+  if (lockedSpillStats->spillMaxLevelExceededCount != 0) {
     lockedStats->addRuntimeStat(
-        "exceededMaxSpillLevel",
-        RuntimeCounter{
-            static_cast<int64_t>(spillStats.spillMaxLevelExceededCount)});
+        kExceededMaxSpillLevel,
+        RuntimeCounter{static_cast<int64_t>(
+            lockedSpillStats->spillMaxLevelExceededCount)});
     common::updateGlobalMaxSpillLevelExceededCount(
-        spillStats.spillMaxLevelExceededCount);
+        lockedSpillStats->spillMaxLevelExceededCount);
   }
+
+  if (lockedSpillStats->spillReadBytes != 0) {
+    lockedStats->addRuntimeStat(
+        kSpillReadBytes,
+        RuntimeCounter{
+            static_cast<int64_t>(lockedSpillStats->spillReadBytes),
+            RuntimeCounter::Unit::kBytes});
+  }
+
+  if (lockedSpillStats->spillReads != 0) {
+    lockedStats->addRuntimeStat(
+        kSpillReads,
+        RuntimeCounter{static_cast<int64_t>(lockedSpillStats->spillReads)});
+  }
+
+  if (lockedSpillStats->spillReadTimeNanos != 0) {
+    lockedStats->addRuntimeStat(
+        kSpillReadTime,
+        RuntimeCounter{
+            static_cast<int64_t>(lockedSpillStats->spillReadTimeNanos),
+            RuntimeCounter::Unit::kNanos});
+  }
+
+  if (lockedSpillStats->spillDeserializationTimeNanos != 0) {
+    lockedStats->addRuntimeStat(
+        kSpillDeserializationTime,
+        RuntimeCounter{
+            static_cast<int64_t>(
+                lockedSpillStats->spillDeserializationTimeNanos),
+            RuntimeCounter::Unit::kNanos});
+  }
+  lockedSpillStats->reset();
 }
 
 std::string Operator::toString() const {
   std::stringstream out;
-  if (auto task = operatorCtx_->task()) {
-    auto driverCtx = operatorCtx_->driverCtx();
-    out << operatorType() << "(" << operatorId() << ")<" << task->taskId()
-        << ":" << driverCtx->pipelineId << "." << driverCtx->driverId << " "
-        << this;
-  } else {
-    out << "<Terminated, no task>";
-  }
+  out << operatorType() << "[" << planNodeId() << "] " << operatorId();
   return out.str();
 }
 
@@ -481,6 +497,10 @@ void OperatorStats::add(const OperatorStats& other) {
   spilledRows += other.spilledRows;
   spilledPartitions += other.spilledPartitions;
   spilledFiles += other.spilledFiles;
+
+  numNullKeys += other.numNullKeys;
+
+  dynamicFilterStats.add(other.dynamicFilterStats);
 }
 
 void OperatorStats::clear() {
@@ -514,6 +534,8 @@ void OperatorStats::clear() {
   spilledRows = 0;
   spilledPartitions = 0;
   spilledFiles = 0;
+
+  dynamicFilterStats.clear();
 }
 
 std::unique_ptr<memory::MemoryReclaimer> Operator::MemoryReclaimer::create(
@@ -534,15 +556,19 @@ void Operator::MemoryReclaimer::enterArbitration() {
   }
 
   Driver* const runningDriver = driverThreadCtx->driverCtx.driver;
-  if (auto opDriver = ensureDriver()) {
-    // NOTE: the current running driver might not be the driver of the operator
-    // that requests memory arbitration. The reason is that an operator might
-    // extend the buffer allocated from the other operator either from the same
-    // or different drivers. But they must be from the same task.
-    VELOX_CHECK_EQ(
-        runningDriver->task()->taskId(),
-        opDriver->task()->taskId(),
-        "The current running driver and the request driver must be from the same task");
+  if (!FLAGS_velox_memory_pool_capacity_transfer_across_tasks) {
+    if (auto opDriver = ensureDriver()) {
+      // NOTE: the current running driver might not be the driver of the
+      // operator that requests memory arbitration. The reason is that an
+      // operator might extend the buffer allocated from the other operator
+      // either from the same or different drivers. But they must be from the
+      // same task as the following check. User could set
+      // FLAGS_transferred_arbitration_allowed=true to bypass this check.
+      VELOX_CHECK_EQ(
+          runningDriver->task()->taskId(),
+          opDriver->task()->taskId(),
+          "The current running driver and the request driver must be from the same task");
+    }
   }
   if (runningDriver->task()->enterSuspended(runningDriver->state()) !=
       StopReason::kNone) {
@@ -560,11 +586,13 @@ void Operator::MemoryReclaimer::leaveArbitration() noexcept {
     return;
   }
   Driver* const runningDriver = driverThreadCtx->driverCtx.driver;
-  if (auto opDriver = ensureDriver()) {
-    VELOX_CHECK_EQ(
-        runningDriver->task()->taskId(),
-        opDriver->task()->taskId(),
-        "The current running driver and the request driver must be from the same task");
+  if (!FLAGS_velox_memory_pool_capacity_transfer_across_tasks) {
+    if (auto opDriver = ensureDriver()) {
+      VELOX_CHECK_EQ(
+          runningDriver->task()->taskId(),
+          opDriver->task()->taskId(),
+          "The current running driver and the request driver must be from the same task");
+    }
   }
   runningDriver->task()->leaveSuspended(runningDriver->state());
 }
@@ -595,8 +623,13 @@ uint64_t Operator::MemoryReclaimer::reclaim(
   }
   VELOX_CHECK_EQ(pool->name(), op_->pool()->name());
   VELOX_CHECK(
-      !driver->state().isOnThread() || driver->state().isSuspended ||
-      driver->state().isTerminated);
+      !driver->state().isOnThread() || driver->state().suspended() ||
+          driver->state().isTerminated,
+      "driverOnThread {}, driverSuspended {} driverTerminated {} {}",
+      driver->state().isOnThread(),
+      driver->state().suspended(),
+      driver->state().isTerminated,
+      pool->name());
   VELOX_CHECK(driver->task()->pauseRequested());
 
   TestValue::adjust(
@@ -610,37 +643,49 @@ uint64_t Operator::MemoryReclaimer::reclaim(
     RECORD_METRIC_VALUE(kMetricMemoryNonReclaimableCount);
     LOG(WARNING) << "Can't reclaim from memory pool " << pool->name()
                  << " which is under non-reclaimable section, memory usage: "
-                 << succinctBytes(pool->currentBytes())
+                 << succinctBytes(pool->usedBytes())
                  << ", reservation: " << succinctBytes(pool->reservedBytes());
     return 0;
   }
 
   RuntimeStatWriterScopeGuard opStatsGuard(op_);
 
-  auto reclaimBytes = memory::MemoryReclaimer::run(
+  return memory::MemoryReclaimer::run(
       [&]() {
-        op_->reclaim(targetBytes, stats);
-        return pool->shrink(targetBytes);
+        int64_t reclaimedBytes{0};
+        {
+          memory::ScopedReclaimedBytesRecorder recoder(pool, &reclaimedBytes);
+          op_->reclaim(targetBytes, stats);
+        }
+        VELOX_CHECK_GE(
+            reclaimedBytes,
+            0,
+            "Unexpected memory growth after reclaim from operator memory pool {}",
+            pool->name());
+        return reclaimedBytes;
       },
       stats);
-
-  return reclaimBytes;
 }
 
 void Operator::MemoryReclaimer::abort(
     memory::MemoryPool* pool,
     const std::exception_ptr& /* error */) {
   std::shared_ptr<Driver> driver = ensureDriver();
-  if (FOLLY_UNLIKELY(driver == nullptr)) {
+  if (driver == nullptr) {
     return;
   }
   VELOX_CHECK_EQ(pool->name(), op_->pool()->name());
   VELOX_CHECK(
-      !driver->state().isOnThread() || driver->state().isSuspended ||
+      !driver->state().isOnThread() || driver->state().suspended() ||
       driver->state().isTerminated);
   VELOX_CHECK(driver->task()->isCancelled());
-
-  // Calls operator abort to free up major memory usage.
-  op_->abort();
+  if (driver->state().isOnThread()) {
+    // We can't abort an operator if it is running on a driver thread for memory
+    // arbitration. Otherwise, it might cause random crash when the driver
+    // thread throws after detects the aborted query.
+    return;
+  }
+  // Calls operator close to free up major memory usage.
+  op_->close();
 }
 } // namespace facebook::velox::exec

@@ -90,16 +90,20 @@ DEBUG_ONLY_TEST_F(ThreadDebugInfoDeathTest, withinTheCallingThread) {
   auto plan =
       PlanBuilder().values({vector}).project({"segFault(c0)"}).planFragment();
 
-  auto queryCtx = std::make_shared<core::QueryCtx>(
+  auto queryCtx = core::QueryCtx::create(
       executor_.get(),
       core::QueryConfig({}),
-      std::unordered_map<std::string, std::shared_ptr<Config>>{},
+      std::unordered_map<std::string, std::shared_ptr<config::ConfigBase>>{},
       cache::AsyncDataCache::getInstance(),
       nullptr,
       nullptr,
       "TaskCursorQuery_0");
   auto task = exec::Task::create(
-      "single.execution.task.0", std::move(plan), 0, queryCtx);
+      "single.execution.task.0",
+      std::move(plan),
+      0,
+      queryCtx,
+      exec::Task::ExecutionMode::kSerial);
 
 #if IS_BUILDING_WITH_ASAN() == 0
   ASSERT_DEATH(

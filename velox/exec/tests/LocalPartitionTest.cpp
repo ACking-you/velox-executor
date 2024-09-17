@@ -43,7 +43,7 @@ class LocalPartitionTest : public HiveConnectorTestBase {
       const std::vector<RowVectorPtr>& vectors) {
     auto filePaths = makeFilePaths(vectors.size());
     for (auto i = 0; i < vectors.size(); i++) {
-      writeToFile(filePaths[i]->path, vectors[i]);
+      writeToFile(filePaths[i]->getPath(), vectors[i]);
     }
     return filePaths;
   }
@@ -78,7 +78,9 @@ class LocalPartitionTest : public HiveConnectorTestBase {
       exec::TaskState expected) {
     if (task->state() != expected) {
       auto& executor = folly::QueuedImmediateExecutor::instance();
-      auto future = task->taskCompletionFuture(1'000'000).via(&executor);
+      auto future = task->taskCompletionFuture()
+                        .within(std::chrono::microseconds(1'000'000))
+                        .via(&executor);
       future.wait();
       EXPECT_EQ(expected, task->state());
     }
@@ -138,7 +140,7 @@ TEST_F(LocalPartitionTest, gather) {
   AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
   for (auto i = 0; i < filePaths.size(); ++i) {
     queryBuilder.split(
-        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->path));
+        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->getPath()));
   }
 
   task = queryBuilder.assertResults("SELECT 300, -71, 152");
@@ -184,7 +186,7 @@ TEST_F(LocalPartitionTest, partition) {
   queryBuilder.maxDrivers(2);
   for (auto i = 0; i < filePaths.size(); ++i) {
     queryBuilder.split(
-        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->path));
+        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->getPath()));
   }
 
   auto task =
@@ -265,7 +267,7 @@ TEST_F(LocalPartitionTest, maxBufferSizePartition) {
     queryBuilder.maxDrivers(2);
     for (auto i = 0; i < filePaths.size(); ++i) {
       queryBuilder.split(
-          scanNodeIds[i % 3], makeHiveConnectorSplit(filePaths[i]->path));
+          scanNodeIds[i % 3], makeHiveConnectorSplit(filePaths[i]->getPath()));
     }
     queryBuilder.config(
         core::QueryConfig::kMaxLocalExchangeBufferSize, bufferSize);
@@ -310,17 +312,17 @@ TEST_F(LocalPartitionTest, indicesBufferCapacity) {
                         .planNode();
   params.copyResult = false;
   params.maxDrivers = 2;
-  TaskCursor cursor(params);
+  auto cursor = TaskCursor::create(params);
   for (auto i = 0; i < filePaths.size(); ++i) {
     auto id = scanNodeIds[i % 3];
-    cursor.task()->addSplit(
-        id, Split(makeHiveConnectorSplit(filePaths[i]->path)));
-    cursor.task()->noMoreSplits(id);
+    cursor->task()->addSplit(
+        id, Split(makeHiveConnectorSplit(filePaths[i]->getPath())));
+    cursor->task()->noMoreSplits(id);
   }
   int numRows = 0;
   int capacity = 0;
-  while (cursor.moveNext()) {
-    auto* batch = cursor.current()->as<RowVector>();
+  while (cursor->moveNext()) {
+    auto* batch = cursor->current()->as<RowVector>();
     ASSERT_EQ(batch->childrenSize(), 1);
     auto& column = batch->childAt(0);
     ASSERT_EQ(column->encoding(), VectorEncoding::Simple::DICTIONARY);
@@ -336,9 +338,13 @@ TEST_F(LocalPartitionTest, blockingOnLocalExchangeQueue) {
   auto localExchangeBufferSize = "1024";
   auto baseVector = vectorMaker_.flatVector<int64_t>(
       10240, [](auto row) { return row / 10; });
-  // Make a small dictionary vector of one row and roughly 8 bytes that is
+  // Make a small flat vector of one row and roughly 8 bytes that is
   // smaller than the localExchangeBufferSize.
   auto smallInput = vectorMaker_.rowVector(
+      {"c0"}, {makeFlatVector<int64_t>(1, folly::identity)});
+  // Make a small dictionary vector of one row with a base vector larger than
+  // the localExchangeBufferSize.
+  auto dictionaryInput = vectorMaker_.rowVector(
       {"c0"}, {wrapInDictionary(makeIndices({0}), baseVector)});
   // Make a large dictionary vector of 1024 rows and roughly 8KB that is larger
   // than the localExchangeBufferSize.
@@ -360,6 +366,8 @@ TEST_F(LocalPartitionTest, blockingOnLocalExchangeQueue) {
     }
   } testSettings[] = {
       {smallInput, 0}, // Small input will not make LocalPartition blocked.
+      {dictionaryInput, 1}, // Large dictiionary values will make LocalPartition
+                            // blocked.
       {largeInput, 1}}; // Large input will make LocalPartition blocked.
 
   for (const auto& test : testSettings) {
@@ -448,7 +456,7 @@ TEST_F(LocalPartitionTest, multipleExchanges) {
   AssertQueryBuilder queryBuilder(op, duckDbQueryRunner_);
   for (auto i = 0; i < filePaths.size(); ++i) {
     queryBuilder.split(
-        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->path));
+        scanNodeIds[i], makeHiveConnectorSplit(filePaths[i]->getPath()));
   }
 
   queryBuilder.maxDrivers(2).assertResults(
@@ -503,7 +511,7 @@ TEST_F(LocalPartitionTest, earlyCancelation) {
   // Make sure results are queued one batch at a time.
   params.bufferedBytes = 100;
 
-  auto cursor = std::make_unique<TaskCursor>(params);
+  auto cursor = TaskCursor::create(params);
   const auto& task = cursor->task();
 
   // Fetch first batch of data.
@@ -520,7 +528,7 @@ TEST_F(LocalPartitionTest, earlyCancelation) {
       ;
       FAIL() << "Expected a throw due to cancellation";
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception&) {
   }
 
   // Wait for task to transition to final state.
@@ -553,12 +561,11 @@ TEST_F(LocalPartitionTest, producerError) {
   CursorParameters params;
   params.planNode = plan;
 
-  auto cursor = std::make_unique<TaskCursor>(params);
+  auto cursor = TaskCursor::create(params);
   const auto& task = cursor->task();
 
   // Expect division by zero error.
-  ASSERT_THROW(
-      while (cursor->moveNext()) { ; }, VeloxException);
+  ASSERT_THROW(while (cursor->moveNext()) { ; }, VeloxException);
 
   // Wait for task to transition to failed state.
   waitForTaskCompletion(task, exec::kFailed);

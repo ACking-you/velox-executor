@@ -44,7 +44,8 @@ class MergeSource {
       const std::string& taskId,
       int destination,
       int64_t maxQueuedBytes,
-      memory::MemoryPool* pool);
+      memory::MemoryPool* pool,
+      folly::Executor* executor);
 };
 
 /// Coordinates data transfer between single producer and single consumer. Used
@@ -63,8 +64,15 @@ class MergeJoinSource {
   void close();
 
  private:
+  // Wait consumer to fetch next batch of data.
+  BlockingReason waitForConsumer(ContinueFuture* future) {
+    producerPromise_ = ContinuePromise("MergeJoinSource::waitForConsumer");
+    *future = producerPromise_->getSemiFuture();
+    return BlockingReason::kWaitForConsumer;
+  }
+
   struct State {
-    bool atEnd;
+    bool atEnd = false;
     RowVectorPtr data;
   };
 

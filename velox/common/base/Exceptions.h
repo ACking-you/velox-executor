@@ -20,12 +20,11 @@
 #include <sstream>
 
 #include <fmt/format.h>
-#include <fmt/ostream.h>
-#include <glog/logging.h>
-
-#include <folly/Conv.h>
-#include <folly/Exception.h>
 #include <folly/Preprocessor.h>
+
+#include <fmt/ostream.h>
+
+#include "velox/common/base/FmtStdFormatters.h"
 #include "velox/common/base/VeloxException.h"
 
 namespace facebook::velox {
@@ -285,6 +284,14 @@ DECLARE_CHECK_FAIL_TEMPLATES(::facebook::velox::VeloxRuntimeError);
       /* isRetriable */ false,                                   \
       ##__VA_ARGS__)
 
+#define VELOX_FILE_NOT_FOUND_ERROR(...)                             \
+  _VELOX_THROW(                                                     \
+      ::facebook::velox::VeloxRuntimeError,                         \
+      ::facebook::velox::error_source::kErrorSourceRuntime.c_str(), \
+      ::facebook::velox::error_code::kFileNotFound.c_str(),         \
+      /* isRetriable */ false,                                      \
+      ##__VA_ARGS__)
+
 #define VELOX_UNREACHABLE(...)                                      \
   _VELOX_THROW(                                                     \
       ::facebook::velox::VeloxRuntimeError,                         \
@@ -311,6 +318,7 @@ DECLARE_CHECK_FAIL_TEMPLATES(::facebook::velox::VeloxRuntimeError);
 #define VELOX_DCHECK_LE(e1, e2, ...) VELOX_CHECK(true)
 #define VELOX_DCHECK_EQ(e1, e2, ...) VELOX_CHECK(true)
 #define VELOX_DCHECK_NE(e1, e2, ...) VELOX_CHECK(true)
+#define VELOX_DCHECK_NULL(e, ...) VELOX_CHECK(true)
 #define VELOX_DCHECK_NOT_NULL(e, ...) VELOX_CHECK(true)
 #endif
 

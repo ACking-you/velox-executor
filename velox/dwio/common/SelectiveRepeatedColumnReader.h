@@ -24,10 +24,6 @@ namespace facebook::velox::dwio::common {
 // logic for dealing with mapping between enclosing and nested rows.
 class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
  public:
-  bool useBulkPath() const override {
-    return false;
-  }
-
   const std::vector<SelectiveColumnReader*>& children() const override {
     return children_;
   }
@@ -52,32 +48,26 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
   /// be inserted at the corresponding position in the result. 'nulls'
   /// is expected to be null flags for 'numRows' next rows at the
   /// level of this reader.
-  virtual void readLengths(
-      int32_t* FOLLY_NONNULL lengths,
-      int32_t numLengths,
-      const uint64_t* FOLLY_NULLABLE nulls) = 0;
+  virtual void
+  readLengths(int32_t* lengths, int32_t numLengths, const uint64_t* nulls) = 0;
 
-  // Create row set for child columns based on the row set of parent column.
-  void makeNestedRowSet(RowSet rows, int32_t maxRow);
+  /// Create row set for child columns based on the row set of parent column.
+  void makeNestedRowSet(const RowSet& rows, int32_t maxRow);
 
-  // Compute the offsets and lengths based on the current filtered rows passed
-  // in.
-  void makeOffsetsAndSizes(RowSet rows, ArrayVectorBase&);
+  /// Compute the offsets and lengths based on the current filtered rows passed
+  /// in.
+  void makeOffsetsAndSizes(const RowSet& rows, ArrayVectorBase&);
 
-  // Creates a struct if '*result' is empty and 'type' is a row.
-  void prepareStructResult(
-      const TypePtr& type,
-      VectorPtr* FOLLY_NULLABLE result) {
+  /// Creates a struct if '*result' is empty and 'type' is a row.
+  void prepareStructResult(const TypePtr& type, VectorPtr* result) {
     if (!*result && type->kind() == TypeKind::ROW) {
-      *result = BaseVector::create(type, 0, &memoryPool_);
+      *result = BaseVector::create(type, 0, memoryPool_);
     }
   }
 
   // Apply filter on parent level.  Child filtering should be handled separately
   // in subclasses.
-  RowSet applyFilter(RowSet rows);
-
-  void setResultNulls(BaseVector& result);
+  RowSet applyFilter(const RowSet& rows);
 
   BufferPtr allLengthsHolder_;
   vector_size_t* allLengths_;
@@ -95,7 +85,7 @@ class SelectiveRepeatedColumnReader : public SelectiveColumnReader {
 class SelectiveListColumnReader : public SelectiveRepeatedColumnReader {
  public:
   SelectiveListColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       FormatParams& params,
       velox::common::ScanSpec& scanSpec);
@@ -108,20 +98,19 @@ class SelectiveListColumnReader : public SelectiveRepeatedColumnReader {
 
   void read(
       vector_size_t offset,
-      RowSet rows,
-      const uint64_t* FOLLY_NULLABLE incomingNulls) override;
+      const RowSet& rows,
+      const uint64_t* incomingNulls) override;
 
-  void getValues(RowSet rows, VectorPtr* FOLLY_NULLABLE result) override;
+  void getValues(const RowSet& rows, VectorPtr* result) override;
 
  protected:
   std::unique_ptr<SelectiveColumnReader> child_;
-  const std::shared_ptr<const dwio::common::TypeWithId> requestedType_;
 };
 
 class SelectiveMapColumnReader : public SelectiveRepeatedColumnReader {
  public:
   SelectiveMapColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       FormatParams& params,
       velox::common::ScanSpec& scanSpec);
@@ -135,14 +124,14 @@ class SelectiveMapColumnReader : public SelectiveRepeatedColumnReader {
 
   void read(
       vector_size_t offset,
-      RowSet rows,
-      const uint64_t* FOLLY_NULLABLE incomingNulls) override;
+      const RowSet& rows,
+      const uint64_t* incomingNulls) override;
 
-  void getValues(RowSet rows, VectorPtr* FOLLY_NULLABLE result) override;
+  void getValues(const RowSet& rows, VectorPtr* result) override;
 
+ protected:
   std::unique_ptr<SelectiveColumnReader> keyReader_;
   std::unique_ptr<SelectiveColumnReader> elementReader_;
-  const std::shared_ptr<const dwio::common::TypeWithId> requestedType_;
 };
 
 } // namespace facebook::velox::dwio::common

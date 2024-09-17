@@ -119,13 +119,12 @@ class MutableRemainingRows {
     return mutableRows_->hasSelections();
   }
 
-  /// @return true if current set of rows might be different from the original
+  /// @return true if current set of rows is different from the original
   /// set of rows, which may happen if deselectNull() or deselectErrors() were
-  /// called. May return 'true' even if current set of rows is the same as
-  /// original set. Returns 'false' only if current set of rows is for sure the
-  /// same as original.
-  bool mayHaveChanged() const {
-    return mutableRows_ != nullptr && !mutableRows_->isAllSelected();
+  /// called.
+  bool hasChanged() const {
+    return mutableRows_ != nullptr &&
+        mutableRows_->countSelected() != originalRows_->countSelected();
   }
 
  private:
@@ -167,6 +166,7 @@ class Expr {
       TypePtr type,
       std::vector<std::shared_ptr<Expr>>&& inputs,
       std::shared_ptr<VectorFunction> vectorFunction,
+      VectorFunctionMetadata metadata,
       std::string name,
       bool trackCpuUsage);
 
@@ -182,7 +182,7 @@ class Expr {
       const SelectivityVector& rows,
       EvalCtx& context,
       VectorPtr& result,
-      const ExprSet* FOLLY_NULLABLE parentExprSet = nullptr);
+      const ExprSet* parentExprSet = nullptr);
 
   /// Evaluates the expression using fast path that assumes all inputs and
   /// intermediate results are flat or constant and have no nulls.
@@ -201,13 +201,13 @@ class Expr {
       const SelectivityVector& rows,
       EvalCtx& context,
       VectorPtr& result,
-      const ExprSet* FOLLY_NULLABLE parentExprSet = nullptr);
+      const ExprSet* parentExprSet = nullptr);
 
   void evalFlatNoNullsImpl(
       const SelectivityVector& rows,
       EvalCtx& context,
       VectorPtr& result,
-      const ExprSet* FOLLY_NULLABLE parentExprSet);
+      const ExprSet* parentExprSet);
 
   // Simplified path for expression evaluation (flattens all vectors).
   void evalSimplified(
@@ -279,6 +279,10 @@ class Expr {
     return false;
   }
 
+  bool hasConditionals() const {
+    return hasConditionals_;
+  }
+
   bool isDeterministic() const {
     return deterministic_;
   }
@@ -295,6 +299,16 @@ class Expr {
 
   void setMultiplyReferenced() {
     isMultiplyReferenced_ = true;
+  }
+
+  /// True if this is a special form where the next argument will always be
+  /// evaluated on a subset of the rows for which the previous one was
+  /// evaluated.  This is true of AND and no other at this time.  This implies
+  /// that lazies can be loaded on first use and not before starting evaluating
+  /// the form.  This is so because a subsequent use will never access rows that
+  /// were not in scope for the previous one.
+  virtual bool evaluatesArgumentsOnNonIncreasingSelection() const {
+    return false;
   }
 
   std::vector<common::Subfield> extractSubfields() const;
@@ -353,7 +367,7 @@ class Expr {
   /// expressable as sql. If not given, they will be converted to
   /// SQL-expressable simple constants.
   virtual std::string toSql(
-      std::vector<VectorPtr>* FOLLY_NULLABLE complexConstants = nullptr) const;
+      std::vector<VectorPtr>* complexConstants = nullptr) const;
 
   const ExprStats& stats() const {
     return stats_;
@@ -361,12 +375,16 @@ class Expr {
 
   void addNulls(
       const SelectivityVector& rows,
-      const uint64_t* FOLLY_NULLABLE rawNulls,
+      const uint64_t* rawNulls,
       EvalCtx& context,
       VectorPtr& result) const;
 
-  auto& vectorFunction() const {
+  const std::shared_ptr<VectorFunction>& vectorFunction() const {
     return vectorFunction_;
+  }
+
+  const VectorFunctionMetadata& vectorFunctionMetadata() const {
+    return vectorFunctionMetadata_;
   }
 
   auto& inputValues() {
@@ -397,8 +415,8 @@ class Expr {
 
  private:
   struct PeelEncodingsResult {
-    SelectivityVector* FOLLY_NULLABLE newRows;
-    SelectivityVector* FOLLY_NULLABLE newFinalSelection;
+    SelectivityVector* newRows;
+    SelectivityVector* newFinalSelection;
     bool mayCache;
 
     static PeelEncodingsResult empty() {
@@ -468,8 +486,9 @@ class Expr {
   /// Evaluation of such expression is optimized by memoizing and reusing
   /// the results of prior evaluations. That logic is implemented in
   /// 'evaluateSharedSubexpr'.
-  bool shouldEvaluateSharedSubexp() const {
-    return deterministic_ && isMultiplyReferenced_ && !inputs_.empty();
+  bool shouldEvaluateSharedSubexp(EvalCtx& context) const {
+    return deterministic_ && isMultiplyReferenced_ && !inputs_.empty() &&
+        context.sharedSubExpressionReuseEnabled();
   }
 
   /// Evaluate common sub-expression. Check if sharedSubexprValues_ already has
@@ -501,7 +520,7 @@ class Expr {
 
   void appendInputsSql(
       std::stringstream& stream,
-      std::vector<VectorPtr>* FOLLY_NULLABLE complexConstants) const;
+      std::vector<VectorPtr>* complexConstants) const;
 
   /// Release 'inputValues_' back to vector pool in 'evalCtx' so they can be
   /// reused.
@@ -552,20 +571,11 @@ class Expr {
   // referenced fields.
   virtual void computeDistinctFields();
 
-  // True if this is a spcial form where the next argument will always be
-  // evaluated on a subset of the rows for which the previous one was evaluated.
-  // This is true of AND and no other at this time.  This implies that lazies
-  // can be loaded on first use and not before starting evaluating the form.
-  // This is so because a subsequent use will never access rows that were not in
-  // scope for the previous one.
-  virtual bool evaluatesArgumentsOnNonIncreasingSelection() const {
-    return false;
-  }
-
   const TypePtr type_;
   const std::vector<std::shared_ptr<Expr>> inputs_;
   const std::string name_;
   const std::shared_ptr<VectorFunction> vectorFunction_;
+  const VectorFunctionMetadata vectorFunctionMetadata_;
   const bool specialForm_;
   const bool supportsFlatNoNullsFastPath_;
   const bool trackCpuUsage_;
@@ -599,6 +609,37 @@ class Expr {
 
   std::vector<VectorPtr> inputValues_;
 
+  /// Represents a set of inputs referenced by 'distinctFields_' that are
+  /// captured when the 'evaluateSharedSubexpr()' method is called on a shared
+  /// sub-expression. The purpose of this class is to ensure that cached
+  /// results are re-used for the correct set of live input vectors.
+  class InputForSharedResults {
+   public:
+    void addInput(const std::shared_ptr<BaseVector>& input) {
+      inputVectors_.push_back(input.get());
+      inputWeakVectors_.push_back(input);
+    }
+
+    bool operator<(const InputForSharedResults& other) const {
+      return inputVectors_ < other.inputVectors_;
+    }
+
+    bool isExpired() const {
+      for (const auto& input : inputWeakVectors_) {
+        if (input.expired()) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+   private:
+    // Used as a key in a map that keeps track of cached results.
+    std::vector<const BaseVector*> inputVectors_;
+    // Used to check if inputs have expired.
+    std::vector<std::weak_ptr<BaseVector>> inputWeakVectors_;
+  };
+
   struct SharedResults {
     // The rows for which 'sharedSubexprValues_' has a value.
     std::unique_ptr<SelectivityVector> sharedSubexprRows_ = nullptr;
@@ -608,7 +649,7 @@ class Expr {
 
   // Maps the inputs referenced by distinctFields_ captuered when
   // evaluateSharedSubexpr() is called to the cached shared results.
-  std::map<std::vector<const BaseVector*>, SharedResults> sharedSubexprResults_;
+  std::map<InputForSharedResults, SharedResults> sharedSubexprResults_;
 
   // Pointers to the last base vector of cachable dictionary input. Used to
   // check if the current input's base vector is the same as the last. If it's
@@ -665,7 +706,7 @@ class ExprSet {
  public:
   explicit ExprSet(
       const std::vector<core::TypedExprPtr>& source,
-      core::ExecCtx* FOLLY_NONNULL execCtx,
+      core::ExecCtx* execCtx,
       bool enableConstantFolding = true);
 
   virtual ~ExprSet();
@@ -689,7 +730,7 @@ class ExprSet {
 
   void clear();
 
-  core::ExecCtx* FOLLY_NULLABLE execCtx() const {
+  core::ExecCtx* execCtx() const {
     return execCtx_;
   }
 
@@ -716,7 +757,7 @@ class ExprSet {
   }
 
   // Flags an expression that remembers the results for a dictionary.
-  void addToMemo(Expr* FOLLY_NONNULL expr) {
+  void addToMemo(Expr* expr) {
     memoizingExprs_.insert(expr);
   }
 
@@ -749,14 +790,14 @@ class ExprSet {
 
   // Exprs which retain memoized state, e.g. from running over dictionaries.
   std::unordered_set<Expr*> memoizingExprs_;
-  core::ExecCtx* FOLLY_NONNULL const execCtx_;
+  core::ExecCtx* const execCtx_;
 };
 
 class ExprSetSimplified : public ExprSet {
  public:
   ExprSetSimplified(
       const std::vector<core::TypedExprPtr>& source,
-      core::ExecCtx* FOLLY_NONNULL execCtx)
+      core::ExecCtx* execCtx)
       : ExprSet(source, execCtx, /*enableConstantFolding*/ false) {}
 
   virtual ~ExprSetSimplified() override {}
@@ -782,7 +823,7 @@ class ExprSetSimplified : public ExprSet {
 // account and instantiates the correct ExprSet class.
 std::unique_ptr<ExprSet> makeExprSetFromFlag(
     std::vector<core::TypedExprPtr>&& source,
-    core::ExecCtx* FOLLY_NONNULL execCtx);
+    core::ExecCtx* execCtx);
 
 /// Returns a string representation of the expression trees annotated with
 /// runtime statistics. Expected to be called after calling ExprSet::eval one or
@@ -814,14 +855,10 @@ class ExprSetListener {
       const ExprSetCompletionEvent& event) = 0;
 
   /// Called when a batch of rows encounters errors processing one or more
-  /// rows in a try expression to provide information about these errors. This
-  /// function must neither change rows nor errors.
-  /// @param rows Rows where errors exist.
-  /// @param errors Error vector produced inside the try expression.
-  virtual void onError(
-      const SelectivityVector& rows,
-      const ErrorVector& errors,
-      const std::string& queryId) = 0;
+  /// rows in a try expression to provide information about these errors.
+  /// @param numRows Number of rows with errors.
+  /// @param queryId Query ID.
+  virtual void onError(vector_size_t numRows, const std::string& queryId) = 0;
 };
 
 /// Return the ExprSetListeners having been registered.

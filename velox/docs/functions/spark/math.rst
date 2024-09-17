@@ -14,9 +14,17 @@ Mathematical Functions
 
     Returns inverse hyperbolic cosine of ``x``.
 
+.. spark:function:: asin(x) -> double
+
+    Returns the arc sine of ``x``.
+
 .. spark:function:: asinh(x) -> double
 
     Returns inverse hyperbolic sine of ``x``.
+
+.. spark:function:: atan(x) -> double
+
+    Returns the arc tangent of ``x``.
 
 .. spark:function:: atan2(y, x) -> double
 
@@ -33,7 +41,7 @@ Mathematical Functions
 .. spark:function:: add(x, y) -> [same as x]
 
     Returns the result of adding x to y. The types of x and y must be the same.
-    For integral types, overflow results in an error. Corresponds to sparks's operator ``+``.
+    Corresponds to sparks's operator ``+``.
 
 .. spark:function:: add(x, y) -> decimal
 
@@ -58,6 +66,30 @@ Mathematical Functions
     Returns ``x`` rounded up to the nearest integer.  
     Supported types are: BIGINT and DOUBLE.
 
+.. function:: checked_add(x, y) -> [same as x]
+
+    Returns the result of adding x to y. The types of x and y must be the same.
+    For integral types, overflow results in an error. Corresponds to Spark's operator ``+`` with ``failOnError`` as true.
+
+.. function:: checked_divide(x, y) -> [same as x]
+
+    Returns the results of dividing x by y. The types of x and y must be the same.
+    Division by zero results in an error. Corresponds to Spark's operator ``/`` with ``failOnError`` as true.
+
+.. function:: checked_multiply(x, y) -> [same as x]
+
+    Returns the result of multiplying x by y. The types of x and y must be the same.
+    For integral types, overflow results in an error. Corresponds to Spark's operator ``*`` with ``failOnError`` as true.
+
+.. function:: checked_subtract(x, y) -> [same as x]
+
+    Returns the result of subtracting y from x. The types of x and y must be the same.
+    For integral types, overflow results in an error. Corresponds to Spark's operator ``-`` with ``failOnError`` as true.
+
+.. spark:function:: cos(x) -> double
+
+    Returns the cosine of ``x``.
+
 .. spark:function:: cosh(x) -> double
 
     Returns the hyperbolic cosine of ``x``.
@@ -69,6 +101,10 @@ Mathematical Functions
 .. spark:function:: csc(x) -> double
 
     Returns the cosecant of ``x``.
+
+.. spark:function:: degrees(x) -> double
+
+    Converts angle x in radians to degrees.
 
 .. spark:function:: divide(x, y) -> double
 
@@ -96,10 +132,31 @@ Mathematical Functions
 
     Returns Euler's number raised to the power of ``x``.
 
+.. spark:function:: expm1(x) -> double
+
+    Returns Euler's number raised to the power of ``x``, minus 1, which is ``exp(x) - 1`` in math. This function expm1(x) is more accurate than ``exp(x) - 1``, when ``x`` is close to zero.
+    If the argument is NaN, the result is NaN.
+    If the argument is positive infinity, then the result is positive infinity.
+    If the argument is negative infinity, then the result is -1.0.
+    If the argument is zero, then the result is a zero with the same sign as the argument.
+
 .. spark:function:: floor(x) -> [same as x]
 
     Returns ``x`` rounded down to the nearest integer.
     Supported types are: BIGINT and DOUBLE.
+
+.. spark:function:: hex(x) -> varchar
+
+    Converts ``x`` to hexadecimal.
+    Supported types are: BIGINT, VARBINARY and VARCHAR.
+    If the argument is a VARCHAR or VARBINARY, the result is string where each input byte is represented using 2 hex characters.
+    If the argument is a positive BIGINT, the result is a hex representation of the number (up to 16 characters),
+    if the argument is a negative BIGINT, the result is a hex representation of the number which will be treated as two's complement. ::
+
+        SELECT hex("Spark SQL"); -- 537061726B2053514C
+        SELECT hex(17); -- 11
+        SELECT hex(-1); -- FFFFFFFFFFFFFFFF
+
 
 .. spark:function:: hypot(a, b) -> double
 
@@ -110,10 +167,15 @@ Mathematical Functions
     Returns true if x is Nan, or false otherwise. Returns false is x is NULL.
     Supported types are: REAL, DOUBLE.
 
-.. spark::function:: log1p(x) -> double
+.. spark:function:: log(base, expr) -> double
+
+    Returns the logarithm of ``expr`` with ``base``.
+    Returns NULL if either ``expr`` or ``base`` is less than or equal to 0.
+
+.. spark:function:: log1p(x) -> double
 
     Returns the natural logarithm of the “given value ``x`` plus one”.
-    Return NULL if x is less than or equal to -1.
+    Returns NULL if x is less than or equal to -1.
 
 .. spark:function:: log2(x) -> double
 
@@ -126,7 +188,7 @@ Mathematical Functions
 .. spark:function:: multiply(x, y) -> [same as x]
 
     Returns the result of multiplying x by y. The types of x and y must be the same.
-    For integral types, overflow results in an error. Corresponds to Spark's operator ``*``.
+    Corresponds to Spark's operator ``*``.
 
 .. spark:function:: multiply(x, y) -> [decimal]
 
@@ -162,14 +224,13 @@ Mathematical Functions
 
         SELECT rand(); -- 0.9629742951434543
 
-.. spark:function:: rand(seed, partitionIndex) -> double
+.. spark:function:: rand(seed) -> double
 
     Returns a random value with uniformly distributed values in [0, 1) using a seed formed
-    by combining user-specified ``seed`` and framework provided ``partitionIndex``. The
+    by combining user-specified ``seed`` and the configuration `spark.partition_id`. The
     framework is responsible for deterministic partitioning of the data and assigning unique
-    ``partitionIndex`` to each thread (in a deterministic way).
-    ``seed`` must be constant. NULL ``seed`` is identical to zero ``seed``. ``partitionIndex``
-    cannot be NULL. ::
+    `spark.partition_id` to each thread (in a deterministic way) .
+    ``seed`` must be constant. NULL ``seed`` is identical to zero ``seed``. ::
 
         SELECT rand(0);    -- 0.5488135024422883
         SELECT rand(NULL); -- 0.5488135024422883
@@ -178,13 +239,22 @@ Mathematical Functions
 
     An alias for ``rand()``.
 
-.. spark:function:: random(seed, partitionIndex) -> double
+.. spark:function:: random(seed) -> double
 
-    An alias for ``rand(seed, partitionIndex)``.
+    An alias for ``rand(seed)``.
 
 .. spark:function:: remainder(n, m) -> [same as n]
 
     Returns the modulus (remainder) of ``n`` divided by ``m``. Corresponds to Spark's operator ``%``.
+    Supported types are: TINYINT, SMALLINT, INTEGER, BIGINT, REAL and DOUBLE.
+
+.. spark:function:: rint(x) -> double
+
+    Returns the double value that is closest in value to the argument and is 
+    equal to a mathematical integer.
+    Returns ``x`` if ``x`` is a positive or negative infinity or a NaN. ::
+
+        SELECT rint(12.3456); -- 12.0
 
 .. spark:function:: round(x, d) -> [same as x]
 
@@ -203,7 +273,7 @@ Mathematical Functions
 .. spark:function:: subtract(x, y) -> [same as x]
 
     Returns the result of subtracting y from x. The types of x and y must be the same.
-    For integral types, overflow results in an error. Corresponds to Spark's operator ``-``.
+    Corresponds to Spark's operator ``-``.
 
 .. spark:function:: subtract(x, y) -> decimal
 
@@ -220,3 +290,38 @@ Mathematical Functions
 .. spark:function:: unaryminus(x) -> [same as x]
 
     Returns the negative of `x`.  Corresponds to Spark's operator ``-``.
+
+.. spark:function:: unhex(x) -> varbinary
+
+    Converts hexadecimal varchar ``x`` to varbinary.
+    ``x`` is considered case insensitive and expected to contain only hexadecimal characters 0-9 and A-F.
+    If ``x`` contains non-hexadecimal character, the function returns NULL.
+    When ``x`` contains an even number of characters, each pair is converted to a single byte. The number of bytes in the result is half the number of bytes in the input.
+    When ``x`` contains an odd number of characters, the first character is decoded into the first byte of the result and the remaining pairs of characters are decoded into subsequent bytes. This behavior matches Spark 3.3.2 and newer. ::
+
+        SELECT unhex("23"); -- #
+        SELECT unhex("f"); -- \x0F
+        SELECT unhex("b2323"); -- \x0B##
+        SELECT unhex("G"); -- NULL
+        SELECT unhex("G23"); -- NULL
+
+.. spark:function:: width_bucket(x, bound1, bound2, n) -> bigint
+
+    Returns the zero-based bucket number to which ``x`` would be assigned in an equiwidth histogram with ``n`` buckets,
+    in the range ``bound1`` to ``bound2``.
+    `bound1` can be greater than `bound2`.
+    If `bound1` less than `bound2`, if `x` less than `bound1` return 0, if `x` greater than or equal to `bound2` return n + 1.
+    If `bound1` greater than `bound2`, if `x` greater than `bound1` return 0, if `x` less than or equal to `bound2` return n + 1.
+    `n` must be a positive integral value. `x`, `bound1`, and `bound2` cannot be NaN. `bound1`, and `bound2` must be finite.
+    `bound1` cannot equal `bound2`;
+    Otherwise, the function will return NULL.
+
+    ::
+        
+        SELECT width_bucket(-1.0, 0.0, 10.0, 5); -- 0
+        SELECT width_bucket(0.1, 0.0, 10.0, 5); -- 1
+        SELECT width_bucket(10.1, 0.0, 10.0, 5); -- 6
+        SELECT width_bucket(-1.0, 10.0, 0.0, 5); -- 6
+        SELECT width_bucket(0.1, 10.0, 0.0, 5); -- 5
+        SELECT width_bucket(10.1, 10.0, 0.0, 5); -- 0
+        SELECT width_bucket(10.1, 10.0, 10.0, 5); -- NULL

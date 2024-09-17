@@ -19,11 +19,12 @@
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/Split.h"
+#include "velox/exec/fuzzer/FuzzerUtil.h"
 #include "velox/exec/fuzzer/InputGenerator.h"
 #include "velox/exec/fuzzer/ReferenceQueryRunner.h"
 #include "velox/exec/fuzzer/ResultVerifier.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
-#include "velox/expression/tests/utils/FuzzerToolkit.h"
+#include "velox/expression/fuzzer/FuzzerToolkit.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 
@@ -47,8 +48,8 @@ DECLARE_bool(log_signature_stats);
 
 namespace facebook::velox::exec::test {
 
-using facebook::velox::test::CallableSignature;
-using facebook::velox::test::SignatureTemplate;
+using facebook::velox::fuzzer::CallableSignature;
+using facebook::velox::fuzzer::SignatureTemplate;
 
 constexpr const std::string_view kPlanNodeFileName = "plan_nodes";
 
@@ -62,20 +63,25 @@ class AggregationFuzzerBase {
           customInputGenerators,
       VectorFuzzer::Options::TimestampPrecision timestampPrecision,
       const std::unordered_map<std::string, std::string>& queryConfigs,
+      const std::unordered_map<std::string, std::string>& hiveConfigs,
+      bool orderableGroupKeys,
       std::unique_ptr<ReferenceQueryRunner> referenceQueryRunner)
       : customVerificationFunctions_{customVerificationFunctions},
         customInputGenerators_{customInputGenerators},
         queryConfigs_{queryConfigs},
+        orderableGroupKeys_{orderableGroupKeys},
         persistAndRunOnce_{FLAGS_persist_and_run_once},
         reproPersistPath_{FLAGS_repro_persist_path},
         referenceQueryRunner_{std::move(referenceQueryRunner)},
         vectorFuzzer_{getFuzzerOptions(timestampPrecision), pool_.get()} {
     filesystems::registerLocalFileSystem();
+    auto configs = hiveConfigs;
     auto hiveConnector =
         connector::getConnectorFactory(
             connector::hive::HiveConnectorFactory::kHiveConnectorName)
             ->newConnector(
-                kHiveConnectorId, std::make_shared<core::MemConfig>());
+                kHiveConnectorId,
+                std::make_shared<config::ConfigBase>(std::move(configs)));
     connector::registerConnector(hiveConnector);
 
     seed(initialSeed);
@@ -101,14 +107,38 @@ class AggregationFuzzerBase {
     size_t numFailed{0};
   };
 
-  enum ReferenceQueryErrorCode {
-    kSuccess,
-    kReferenceQueryFail,
-    kReferenceQueryUnsupported
+ protected:
+  struct Stats {
+    // Names of functions that were tested.
+    std::unordered_set<std::string> functionNames;
+
+    // Number of iterations using aggregations over sorted inputs.
+    size_t numSortedInputs{0};
+
+    // Number of iterations where results were verified against reference DB,
+    size_t numVerified{0};
+
+    // Number of iterations where results verification was skipped because
+    // function results are non-determinisic.
+    size_t numVerificationSkipped{0};
+
+    // Number of iterations where results verification was skipped because
+    // reference DB doesn't support the query.
+    size_t numReferenceQueryNotSupported{0};
+
+    // Number of iterations where results verification was skipped because
+    // reference DB failed to execute the query.
+    size_t numReferenceQueryFailed{0};
+
+    // Number of iterations where aggregation failed.
+    size_t numFailed{0};
+
+    void print(size_t numIterations) const;
+
+    void updateReferenceQueryStats(ReferenceQueryErrorCode errorCode);
   };
 
- protected:
-  static inline const std::string kHiveConnectorId = "test-hive";
+  int32_t randInt(int32_t min, int32_t max);
 
   bool addSignature(
       const std::string& name,
@@ -119,12 +149,6 @@ class AggregationFuzzerBase {
 
   std::shared_ptr<InputGenerator> findInputGenerator(
       const CallableSignature& signature);
-
-  static exec::Split makeSplit(const std::string& filePath);
-
-  std::vector<exec::Split> makeSplits(
-      const std::vector<RowVectorPtr>& inputs,
-      const std::string& path);
 
   PlanWithSplits deserialize(const folly::dynamic& obj);
 
@@ -149,7 +173,7 @@ class AggregationFuzzerBase {
     seed(rng_());
   }
 
-  // Generate at least one and up to 5 scalar columns to be used as grouping,
+  // Generates at least one and up to 5 scalar columns to be used as grouping,
   // partition or sorting keys.
   // Column names are generated using template '<prefix>N', where N is
   // zero-based ordinal number of the column.
@@ -179,19 +203,27 @@ class AggregationFuzzerBase {
   std::vector<RowVectorPtr> generateInputDataWithRowNumber(
       std::vector<std::string> names,
       std::vector<TypePtr> types,
+      const std::vector<std::string>& partitionKeys,
       const CallableSignature& signature);
 
-  std::pair<std::optional<MaterializedRowMultiset>, ReferenceQueryErrorCode>
-  computeReferenceResults(
-      const core::PlanNodePtr& plan,
-      const std::vector<RowVectorPtr>& input);
-
-  velox::test::ResultOrError execute(
+  velox::fuzzer::ResultOrError execute(
       const core::PlanNodePtr& plan,
       const std::vector<exec::Split>& splits = {},
       bool injectSpill = false,
       bool abandonPartial = false,
       int32_t maxDrivers = 2);
+
+  void compare(
+      const velox::fuzzer::ResultOrError& actual,
+      bool customVerification,
+      const std::vector<std::shared_ptr<ResultVerifier>>& customVerifiers,
+      const velox::fuzzer::ResultOrError& expected);
+
+  /// Returns false if the type or its children are unsupported.
+  /// Currently returns false if type is Date,IntervalDayTime or Unknown.
+  /// @param type
+  /// @return bool
+  bool isSupportedType(const TypePtr& type) const;
 
   // @param customVerification If false, results are compared as is. Otherwise,
   // only row counts are compared.
@@ -204,16 +236,21 @@ class AggregationFuzzerBase {
       bool abandonPartial,
       bool customVerification,
       const std::vector<std::shared_ptr<ResultVerifier>>& customVerifiers,
-      const velox::test::ResultOrError& expected,
+      const velox::fuzzer::ResultOrError& expected,
       int32_t maxDrivers = 2);
 
   void printSignatureStats();
+
+  void logVectors(const std::vector<RowVectorPtr>& vectors);
 
   const std::unordered_map<std::string, std::shared_ptr<ResultVerifier>>
       customVerificationFunctions_;
   const std::unordered_map<std::string, std::shared_ptr<InputGenerator>>
       customInputGenerators_;
   const std::unordered_map<std::string, std::string> queryConfigs_;
+
+  // Whether group keys must be orderable or be just comparable.
+  bool orderableGroupKeys_;
   const bool persistAndRunOnce_;
   const std::string reproPersistPath_;
 
@@ -234,6 +271,8 @@ class AggregationFuzzerBase {
   std::shared_ptr<memory::MemoryPool> rootPool_{
       memory::memoryManager()->addRootPool()};
   std::shared_ptr<memory::MemoryPool> pool_{rootPool_->addLeafChild("leaf")};
+  std::shared_ptr<memory::MemoryPool> writerPool_{
+      rootPool_->addAggregateChild("aggregationFuzzerWriter")};
   VectorFuzzer vectorFuzzer_;
 };
 
@@ -250,28 +289,40 @@ bool isDone(size_t i, T startTime) {
   return i >= FLAGS_steps;
 }
 
-// Returns whether type is supported in TableScan. Empty Row type and Unknown
-// type are not supported.
-bool isTableScanSupported(const TypePtr& type);
-
 // Prints statistics about supported and unsupported function signatures.
 void printStats(const AggregationFuzzerBase::FunctionsStats& stats);
 
 // Prints (n / total) in percentage format.
 std::string printPercentageStat(size_t n, size_t total);
 
-// Make an aggregation call string for the given function name and arguments.
+// Makes an aggregation call string for the given function name and arguments.
 std::string makeFunctionCall(
     const std::string& name,
     const std::vector<std::string>& argNames,
-    bool sortedInputs);
+    bool sortedInputs = false,
+    bool distinctInputs = false,
+    bool ignoreNulls = false);
 
 // Returns a list of column names from c0 to cn.
 std::vector<std::string> makeNames(size_t n);
 
-// Persist plans to files under basePath.
+// Persists plans to files under basePath.
 void persistReproInfo(
     const std::vector<AggregationFuzzerBase::PlanWithSplits>& plans,
     const std::string& basePath);
+
+// Returns a PrestoQueryRunner instance if prestoUrl is non-empty. Otherwise,
+// returns a DuckQueryRunner instance and set disabled aggregation functions
+// properly.
+std::unique_ptr<ReferenceQueryRunner> setupReferenceQueryRunner(
+    memory::MemoryPool* aggregatePool,
+    const std::string& prestoUrl,
+    const std::string& runnerName,
+    const uint32_t& reqTimeoutMs);
+
+// Returns the function name used in a WindowNode. The input `node` should be a
+// pointer to a WindowNode.
+std::vector<std::string> retrieveWindowFunctionName(
+    const core::PlanNodePtr& node);
 
 } // namespace facebook::velox::exec::test

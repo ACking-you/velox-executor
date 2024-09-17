@@ -56,7 +56,7 @@ facebook::velox::parquet::ParquetReader createReader(
     const facebook::velox::dwio::common::ReaderOptions& opts) {
   return facebook::velox::parquet::ParquetReader(
       std::make_unique<facebook::velox::dwio::common::BufferedInput>(
-          std::make_shared<LocalReadFile>(path), opts.getMemoryPool()),
+          std::make_shared<LocalReadFile>(path), opts.memoryPool()),
       opts);
 }
 
@@ -233,7 +233,7 @@ BENCHMARK_DRAW_LINE();
 } // namespace facebook::velox::test
 
 int main(int argc, char** argv) {
-  folly::init(&argc, &argv);
+  folly::Init init{&argc, &argv};
   facebook::velox::memory::MemoryManager::initialize({});
   folly::runBenchmarks();
   return 0;

@@ -42,6 +42,9 @@ class S3FileSystemTest : public S3Test {
 } // namespace
 
 TEST_F(S3FileSystemTest, writeAndRead) {
+  /// The hive config used for Minio defaults to turning
+  /// off using proxy settings if the environment provides them.
+  setenv("HTTP_PROXY", "http://test:test@127.0.0.1:8888", 1);
   const char* bucketName = "data";
   const char* file = "test.txt";
   const std::string filename = localPath(bucketName) + "/" + file;
@@ -59,11 +62,11 @@ TEST_F(S3FileSystemTest, writeAndRead) {
 
 TEST_F(S3FileSystemTest, invalidCredentialsConfig) {
   {
-    const std::unordered_map<std::string, std::string> config(
+    std::unordered_map<std::string, std::string> config(
         {{"hive.s3.use-instance-credentials", "true"},
          {"hive.s3.iam-role", "dummy-iam-role"}});
     auto hiveConfig =
-        std::make_shared<const core::MemConfig>(std::move(config));
+        std::make_shared<const config::ConfigBase>(std::move(config));
 
     // Both instance credentials and iam-role cannot be specified
     VELOX_ASSERT_THROW(
@@ -71,34 +74,34 @@ TEST_F(S3FileSystemTest, invalidCredentialsConfig) {
         "Invalid configuration: specify only one among 'access/secret keys', 'use instance credentials', 'IAM role'");
   }
   {
-    const std::unordered_map<std::string, std::string> config(
+    std::unordered_map<std::string, std::string> config(
         {{"hive.s3.aws-secret-key", "dummy-key"},
          {"hive.s3.aws-access-key", "dummy-key"},
          {"hive.s3.iam-role", "dummy-iam-role"}});
     auto hiveConfig =
-        std::make_shared<const core::MemConfig>(std::move(config));
+        std::make_shared<const config::ConfigBase>(std::move(config));
     // Both access/secret keys and iam-role cannot be specified
     VELOX_ASSERT_THROW(
         filesystems::S3FileSystem(hiveConfig),
         "Invalid configuration: specify only one among 'access/secret keys', 'use instance credentials', 'IAM role'");
   }
   {
-    const std::unordered_map<std::string, std::string> config(
+    std::unordered_map<std::string, std::string> config(
         {{"hive.s3.aws-secret-key", "dummy"},
          {"hive.s3.aws-access-key", "dummy"},
          {"hive.s3.use-instance-credentials", "true"}});
     auto hiveConfig =
-        std::make_shared<const core::MemConfig>(std::move(config));
+        std::make_shared<const config::ConfigBase>(std::move(config));
     // Both access/secret keys and instance credentials cannot be specified
     VELOX_ASSERT_THROW(
         filesystems::S3FileSystem(hiveConfig),
         "Invalid configuration: specify only one among 'access/secret keys', 'use instance credentials', 'IAM role'");
   }
   {
-    const std::unordered_map<std::string, std::string> config(
+    std::unordered_map<std::string, std::string> config(
         {{"hive.s3.aws-secret-key", "dummy"}});
     auto hiveConfig =
-        std::make_shared<const core::MemConfig>(std::move(config));
+        std::make_shared<const config::ConfigBase>(std::move(config));
     // Both access key and secret key must be specified
     VELOX_ASSERT_THROW(
         filesystems::S3FileSystem(hiveConfig),
@@ -113,16 +116,18 @@ TEST_F(S3FileSystemTest, missingFile) {
   addBucket(bucketName);
   auto hiveConfig = minioServer_->hiveConfig();
   filesystems::S3FileSystem s3fs(hiveConfig);
-  VELOX_ASSERT_THROW(
+  VELOX_ASSERT_RUNTIME_THROW_CODE(
       s3fs.openFileForRead(s3File),
+      error_code::kFileNotFound,
       "Failed to get metadata for S3 object due to: 'Resource not found'. Path:'s3://data1/i-do-not-exist.txt', SDK Error Type:16, HTTP Status Code:404, S3 Service:'MinIO', Message:'No response body.'");
 }
 
 TEST_F(S3FileSystemTest, missingBucket) {
   auto hiveConfig = minioServer_->hiveConfig();
   filesystems::S3FileSystem s3fs(hiveConfig);
-  VELOX_ASSERT_THROW(
+  VELOX_ASSERT_RUNTIME_THROW_CODE(
       s3fs.openFileForRead(kDummyPath),
+      error_code::kFileNotFound,
       "Failed to get metadata for S3 object due to: 'Resource not found'. Path:'s3://dummy/foo.txt', SDK Error Type:16, HTTP Status Code:404, S3 Service:'MinIO', Message:'No response body.'");
 }
 
@@ -162,7 +167,8 @@ TEST_F(S3FileSystemTest, noBackendServer) {
 TEST_F(S3FileSystemTest, logLevel) {
   std::unordered_map<std::string, std::string> config;
   auto checkLogLevelName = [&config](std::string_view expected) {
-    auto s3Config = std::make_shared<const core::MemConfig>(config);
+    auto s3Config =
+        std::make_shared<const config::ConfigBase>(std::move(config));
     filesystems::S3FileSystem s3fs(s3Config);
     EXPECT_EQ(s3fs.getLogLevelName(), expected);
   };
@@ -185,7 +191,8 @@ TEST_F(S3FileSystemTest, writeFileAndRead) {
   auto hiveConfig = minioServer_->hiveConfig();
   filesystems::S3FileSystem s3fs(hiveConfig);
   auto pool = memory::memoryManager()->addLeafPool("S3FileSystemTest");
-  auto writeFile = s3fs.openFileForWrite(s3File, {{}, pool.get()});
+  auto writeFile =
+      s3fs.openFileForWrite(s3File, {{}, pool.get(), std::nullopt});
   auto s3WriteFile = dynamic_cast<filesystems::S3WriteFile*>(writeFile.get());
   std::string dataContent =
       "Dance me to your beauty with a burning violin"
@@ -246,5 +253,14 @@ TEST_F(S3FileSystemTest, writeFileAndRead) {
   }
   // Verify the last chunk.
   ASSERT_EQ(readFile->pread(contentSize * 250'000, contentSize), dataContent);
+}
+
+TEST_F(S3FileSystemTest, invalidConnectionSettings) {
+  auto hiveConfig =
+      minioServer_->hiveConfig({{"hive.s3.connect-timeout", "400"}});
+  VELOX_ASSERT_THROW(filesystems::S3FileSystem(hiveConfig), "Invalid duration");
+
+  hiveConfig = minioServer_->hiveConfig({{"hive.s3.socket-timeout", "abc"}});
+  VELOX_ASSERT_THROW(filesystems::S3FileSystem(hiveConfig), "Invalid duration");
 }
 } // namespace facebook::velox

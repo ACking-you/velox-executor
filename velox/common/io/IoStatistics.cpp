@@ -46,6 +46,10 @@ uint64_t IoStatistics::totalScanTime() const {
   return totalScanTime_.load(std::memory_order_relaxed);
 }
 
+uint64_t IoStatistics::writeIOTimeUs() const {
+  return writeIOTimeUs_.load(std::memory_order_relaxed);
+}
+
 uint64_t IoStatistics::incRawBytesRead(int64_t v) {
   return rawBytesRead_.fetch_add(v, std::memory_order_relaxed);
 }
@@ -70,22 +74,32 @@ uint64_t IoStatistics::incTotalScanTime(int64_t v) {
   return totalScanTime_.fetch_add(v, std::memory_order_relaxed);
 }
 
+uint64_t IoStatistics::incWriteIOTimeUs(int64_t v) {
+  return writeIOTimeUs_.fetch_add(v, std::memory_order_relaxed);
+}
+
 void IoStatistics::incOperationCounters(
     const std::string& operation,
     const uint64_t resourceThrottleCount,
     const uint64_t localThrottleCount,
+    const uint64_t networkThrottleCount,
     const uint64_t globalThrottleCount,
     const uint64_t retryCount,
     const uint64_t latencyInMs,
-    const uint64_t delayInjectedInSecs) {
+    const uint64_t delayInjectedInSecs,
+    const uint64_t fullThrottleCount,
+    const uint64_t partialThrottleCount) {
   std::lock_guard<std::mutex> lock{operationStatsMutex_};
   operationStats_[operation].localThrottleCount += localThrottleCount;
   operationStats_[operation].resourceThrottleCount += resourceThrottleCount;
+  operationStats_[operation].networkThrottleCount += networkThrottleCount;
   operationStats_[operation].globalThrottleCount += globalThrottleCount;
   operationStats_[operation].retryCount += retryCount;
   operationStats_[operation].latencyInMs += latencyInMs;
   operationStats_[operation].requestCount++;
   operationStats_[operation].delayInjectedInSecs += delayInjectedInSecs;
+  operationStats_[operation].fullThrottleCount += fullThrottleCount;
+  operationStats_[operation].partialThrottleCount += partialThrottleCount;
 }
 
 std::unordered_map<std::string, OperationCounters>
@@ -114,22 +128,28 @@ void IoStatistics::merge(const IoStatistics& other) {
 void OperationCounters::merge(const OperationCounters& other) {
   resourceThrottleCount += other.resourceThrottleCount;
   localThrottleCount += other.localThrottleCount;
+  networkThrottleCount += other.networkThrottleCount;
   globalThrottleCount += other.globalThrottleCount;
   retryCount += other.retryCount;
   latencyInMs += other.latencyInMs;
   requestCount += other.requestCount;
   delayInjectedInSecs += other.delayInjectedInSecs;
+  fullThrottleCount += other.fullThrottleCount;
+  partialThrottleCount += other.partialThrottleCount;
 }
 
 folly::dynamic serialize(const OperationCounters& counters) {
   folly::dynamic json = folly::dynamic::object;
   json["latencyInMs"] = counters.latencyInMs;
   json["localThrottleCount"] = counters.localThrottleCount;
+  json["networkThrottleCount"] = counters.networkThrottleCount;
   json["resourceThrottleCount"] = counters.resourceThrottleCount;
   json["globalThrottleCount"] = counters.globalThrottleCount;
   json["retryCount"] = counters.retryCount;
   json["requestCount"] = counters.requestCount;
   json["delayInjectedInSecs"] = counters.delayInjectedInSecs;
+  json["fullThrottleCount"] = counters.fullThrottleCount;
+  json["partialThrottleCount"] = counters.partialThrottleCount;
   return json;
 }
 

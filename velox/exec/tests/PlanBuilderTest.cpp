@@ -98,7 +98,11 @@ void registerWindowFunction() {
           .returnType("BIGINT")
           .build(),
   };
-  exec::registerWindowFunction("window1", std::move(signatures), nullptr);
+  exec::registerWindowFunction(
+      "window1",
+      std::move(signatures),
+      exec::WindowFunction::Metadata::defaultMetadata(),
+      nullptr);
 }
 } // namespace
 
@@ -118,7 +122,7 @@ TEST_F(PlanBuilderTest, windowFunctionCall) {
           .window({"window1(c) over (partition by a order by b) as d"})
           .planNode()
           ->toString(true, false),
-      "-- Window[partition by [a] order by [b ASC NULLS LAST] "
+      "-- Window[1][partition by [a] order by [b ASC NULLS LAST] "
       "d := window1(ROW[\"c\"]) RANGE between UNBOUNDED PRECEDING and CURRENT ROW] "
       "-> a:VARCHAR, b:BIGINT, c:BIGINT, d:BIGINT\n");
 
@@ -128,7 +132,7 @@ TEST_F(PlanBuilderTest, windowFunctionCall) {
           .window({"window1(c) over (partition by a) as d"})
           .planNode()
           ->toString(true, false),
-      "-- Window[partition by [a] "
+      "-- Window[1][partition by [a] "
       "d := window1(ROW[\"c\"]) RANGE between UNBOUNDED PRECEDING and CURRENT ROW] "
       "-> a:VARCHAR, b:BIGINT, c:BIGINT, d:BIGINT\n");
 
@@ -138,7 +142,7 @@ TEST_F(PlanBuilderTest, windowFunctionCall) {
           .window({"window1(c) over ()"})
           .planNode()
           ->toString(true, false),
-      "-- Window[w0 := window1(ROW[\"c\"]) RANGE between UNBOUNDED PRECEDING and CURRENT ROW] "
+      "-- Window[1][w0 := window1(ROW[\"c\"]) RANGE between UNBOUNDED PRECEDING and CURRENT ROW] "
       "-> a:VARCHAR, b:BIGINT, c:BIGINT, w0:BIGINT\n");
 
   VELOX_ASSERT_THROW(
@@ -177,7 +181,7 @@ TEST_F(PlanBuilderTest, windowFrame) {
                "window1(c) over (partition by a order by b range between unbounded preceding and unbounded following) as d10"})
           .planNode()
           ->toString(true, false),
-      "-- Window[partition by [a] order by [b ASC NULLS LAST] "
+      "-- Window[1][partition by [a] order by [b ASC NULLS LAST] "
       "d1 := window1(ROW[\"c\"]) ROWS between b PRECEDING and CURRENT ROW, "
       "d2 := window1(ROW[\"c\"]) RANGE between b PRECEDING and CURRENT ROW, "
       "d3 := window1(ROW[\"c\"]) ROWS between UNBOUNDED PRECEDING and CURRENT ROW, "
@@ -239,4 +243,11 @@ TEST_F(PlanBuilderTest, windowFrame) {
           .planNode(),
       "Window frame of type RANGE PRECEDING or FOLLOWING requires single sorting key in ORDER BY");
 }
+
+TEST_F(PlanBuilderTest, missingOutputType) {
+  VELOX_ASSERT_THROW(
+      PlanBuilder().startTableScan().endTableScan(),
+      "outputType must be specified");
+}
+
 } // namespace facebook::velox::exec::test

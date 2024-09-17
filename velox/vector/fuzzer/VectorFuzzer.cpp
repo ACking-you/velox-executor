@@ -118,26 +118,51 @@ int128_t rand(FuzzerGenerator& rng) {
   return HugeInt::build(rand<int64_t>(rng), rand<uint64_t>(rng));
 }
 
+template <typename T, typename std::enable_if_t<std::is_integral_v<T>, int> = 0>
+T rand(FuzzerGenerator& rng, T min, T max) {
+  return boost::random::uniform_int_distribution<T>(min, max)(rng);
+}
+
 Timestamp randTimestamp(FuzzerGenerator& rng, VectorFuzzer::Options opts) {
+  // Generate timestamps only in the valid range to avoid datetime functions,
+  // such as try_cast(varchar as timestamp), throwing VeloxRuntimeError in
+  // fuzzers.
+  constexpr int64_t min = -2'140'671'600;
+  constexpr int64_t max = 2'140'671'600;
+  constexpr int64_t microInSecond = 1'000'000;
+  constexpr int64_t millisInSecond = 1'000;
+
   switch (opts.timestampPrecision) {
     case VectorFuzzer::Options::TimestampPrecision::kNanoSeconds:
-      return Timestamp(rand<int32_t>(rng), (rand<int64_t>(rng) % MAX_NANOS));
+      return Timestamp(
+          rand<int64_t>(rng, min, max), (rand<int64_t>(rng) % MAX_NANOS));
     case VectorFuzzer::Options::TimestampPrecision::kMicroSeconds:
-      return Timestamp::fromMicros(rand<int64_t>(rng));
+      return Timestamp::fromMicros(
+          rand<int64_t>(rng, min, max) * microInSecond +
+          rand<int64_t>(rng, -microInSecond, microInSecond));
     case VectorFuzzer::Options::TimestampPrecision::kMilliSeconds:
-      return Timestamp::fromMillis(rand<int64_t>(rng));
+      return Timestamp::fromMillis(
+          rand<int64_t>(rng, min, max) * millisInSecond +
+          rand<int64_t>(rng, -millisInSecond, millisInSecond));
     case VectorFuzzer::Options::TimestampPrecision::kSeconds:
-      return Timestamp(rand<int32_t>(rng), 0);
+      return Timestamp(rand<int64_t>(rng, min, max), 0);
   }
   return {}; // no-op.
+}
+
+int32_t randDate(FuzzerGenerator& rng) {
+  constexpr int64_t min = -24'450;
+  constexpr int64_t max = 24'450;
+  return rand<int32_t>(rng, min, max);
 }
 
 size_t getElementsVectorLength(
     const VectorFuzzer::Options& opts,
     vector_size_t size) {
-  if (opts.containerVariableLength == false &&
-      size * opts.containerLength > opts.complexElementsMaxSize) {
-    VELOX_USER_FAIL(
+  if (!opts.containerVariableLength) {
+    VELOX_USER_CHECK_LE(
+        size * opts.containerLength,
+        opts.complexElementsMaxSize,
         "Requested fixed opts.containerVariableLength can't be satisfied: "
         "increase opts.complexElementsMaxSize, reduce opts.containerLength"
         " or make opts.containerVariableLength=true");
@@ -250,6 +275,9 @@ VectorPtr fuzzConstantPrimitiveImpl(
   if constexpr (std::is_same_v<TCpp, Timestamp>) {
     return std::make_shared<ConstantVector<TCpp>>(
         pool, size, false, type, randTimestamp(rng, opts));
+  } else if (type->isDate()) {
+    return std::make_shared<ConstantVector<int32_t>>(
+        pool, size, false, type, randDate(rng));
   } else if (type->isShortDecimal()) {
     return std::make_shared<ConstantVector<int64_t>>(
         pool, size, false, type, randShortDecimal(type, rng));
@@ -292,6 +320,12 @@ void fuzzFlatPrimitiveImpl(
         flatVector->set(i, rand<int128_t>(rng));
       } else {
         VELOX_NYI();
+      }
+    } else if constexpr (std::is_same_v<TCpp, int32_t>) {
+      if (vector->type()->isDate()) {
+        flatVector->set(i, randDate(rng));
+      } else {
+        flatVector->set(i, rand<TCpp>(rng));
       }
     } else {
       flatVector->set(i, rand<TCpp>(rng));
@@ -821,6 +855,12 @@ TypePtr VectorFuzzer::randOrderableType(int maxDepth) {
   return velox::randOrderableType(rng_, maxDepth);
 }
 
+TypePtr VectorFuzzer::randOrderableType(
+    const std::vector<TypePtr>& scalarTypes,
+    int maxDepth) {
+  return velox::randOrderableType(rng_, scalarTypes, maxDepth);
+}
+
 TypePtr VectorFuzzer::randType(
     const std::vector<TypePtr>& scalarTypes,
     int maxDepth) {
@@ -998,15 +1038,15 @@ VectorPtr VectorLoaderWrap::makeEncodingPreservedCopy(
       [&](auto row) { rawIndices[row] = decodedIndices[row]; });
 
   BufferPtr nulls = nullptr;
-  if (decoded.nulls() || vectorSize > rows.end()) {
+  if (decoded.nulls(&rows) || vectorSize > rows.end()) {
     // We fill [rows.end(), vectorSize) with nulls then copy nulls for selected
     // baseRows.
     nulls = allocateNulls(vectorSize, vector_->pool(), bits::kNull);
     if (baseRows.hasSelections()) {
-      if (decoded.nulls()) {
+      if (decoded.nulls(&rows)) {
         std::memcpy(
             nulls->asMutable<uint64_t>(),
-            decoded.nulls(),
+            decoded.nulls(&rows),
             bits::nbytes(rows.end()));
       } else {
         bits::fillBits(
@@ -1019,9 +1059,7 @@ VectorPtr VectorLoaderWrap::makeEncodingPreservedCopy(
       std::move(nulls), std::move(indices), vectorSize, baseResult);
 }
 
-namespace {
-
-const std::vector<TypePtr> defaultScalarTypes() {
+const std::vector<TypePtr>& defaultScalarTypes() {
   // @TODO Add decimal TypeKinds to randType.
   // Refer https://github.com/facebookincubator/velox/issues/3942
   static std::vector<TypePtr> kScalarTypes{
@@ -1040,31 +1078,9 @@ const std::vector<TypePtr> defaultScalarTypes() {
   };
   return kScalarTypes;
 }
-} // namespace
 
 TypePtr randType(FuzzerGenerator& rng, int maxDepth) {
   return randType(rng, defaultScalarTypes(), maxDepth);
-}
-
-TypePtr randOrderableType(FuzzerGenerator& rng, int maxDepth) {
-  // Should we generate a scalar type?
-  if (maxDepth <= 1 || rand<bool>(rng)) {
-    return randType(rng, 0);
-  }
-
-  // ARRAY or ROW?
-  if (rand<bool>(rng)) {
-    return ARRAY(randOrderableType(rng, maxDepth - 1));
-  }
-
-  auto numFields = 1 + rand<uint32_t>(rng) % 7;
-  std::vector<std::string> names;
-  std::vector<TypePtr> fields;
-  for (int i = 0; i < numFields; ++i) {
-    names.push_back(fmt::format("f{}", i));
-    fields.push_back(randOrderableType(rng, maxDepth - 1));
-  }
-  return ROW(std::move(names), std::move(fields));
 }
 
 TypePtr randType(
@@ -1086,6 +1102,34 @@ TypePtr randType(
     default:
       return randRowType(rng, scalarTypes, maxDepth - 1);
   }
+}
+
+TypePtr randOrderableType(FuzzerGenerator& rng, int maxDepth) {
+  return randOrderableType(rng, defaultScalarTypes(), maxDepth);
+}
+
+TypePtr randOrderableType(
+    FuzzerGenerator& rng,
+    const std::vector<TypePtr>& scalarTypes,
+    int maxDepth) {
+  // Should we generate a scalar type?
+  if (maxDepth <= 1 || rand<bool>(rng)) {
+    return randType(rng, scalarTypes, 0);
+  }
+
+  // ARRAY or ROW?
+  if (rand<bool>(rng)) {
+    return ARRAY(randOrderableType(rng, scalarTypes, maxDepth - 1));
+  }
+
+  auto numFields = 1 + rand<uint32_t>(rng) % 7;
+  std::vector<std::string> names;
+  std::vector<TypePtr> fields;
+  for (int i = 0; i < numFields; ++i) {
+    names.push_back(fmt::format("f{}", i));
+    fields.push_back(randOrderableType(rng, scalarTypes, maxDepth - 1));
+  }
+  return ROW(std::move(names), std::move(fields));
 }
 
 RowTypePtr randRowType(FuzzerGenerator& rng, int maxDepth) {

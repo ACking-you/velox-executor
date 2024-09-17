@@ -31,7 +31,6 @@ class ChecksumAggregateTest : public AggregationTestBase {
  protected:
   void SetUp() override {
     AggregationTestBase::SetUp();
-    allowInputShuffle();
   }
 
   template <typename T>
@@ -56,13 +55,7 @@ class ChecksumAggregateTest : public AggregationTestBase {
         fmt::format("VALUES (CAST(\'{}\' AS VARCHAR))", expectedChecksum);
 
     testAggregations(
-        rowVectors,
-        {},
-        {"checksum(c0)"},
-        {"to_base64(a0)"},
-        expectedDuckDbSql,
-        /*config*/ {},
-        testWithTableScan);
+        rowVectors, {}, {"checksum(c0)"}, {"to_base64(a0)"}, expectedDuckDbSql);
   }
 
   template <typename G, typename T>
@@ -129,6 +122,7 @@ TEST_F(ChecksumAggregateTest, doubles) {
   assertSingleGroupChecksum<double>({99.9}, "iVY+6I1lKyo=");
   assertSingleGroupChecksum<double>({1, 2, 3}, "AACEg9cR14o=");
   assertSingleGroupChecksum<double>({kNaN, kNaN, kNaN}, "AACMau93L28=");
+  assertSingleGroupChecksum<double>({{-0.0}}, "AAAAAAAAAAA=");
 
   assertGroupingChecksum<int8_t, double>(
       {'a', 'b', 'a'}, {1, 2, 3}, {"AACEI6XSDyU=", "AAAAYDI/x2U="});
@@ -137,7 +131,7 @@ TEST_F(ChecksumAggregateTest, doubles) {
   assertGroupingChecksum<int8_t, double>(
       {1, 1, 2}, {kNaN, kNaN, kNaN}, {"AAAIR0qlH0o=", "AACEI6XSDyU="});
   assertGroupingChecksum<int8_t, double>(
-      {1, 2}, {0.0, -0.0}, {"AAAAAAAAAAA=", "AAAAQMzUhO4="});
+      {1, 2}, {0.0, -0.0}, {"AAAAAAAAAAA=", "AAAAAAAAAAA="});
 }
 
 TEST_F(ChecksumAggregateTest, reals) {
@@ -146,6 +140,7 @@ TEST_F(ChecksumAggregateTest, reals) {
   assertSingleGroupChecksum<float>({99.9}, "IX/UyPhj6MY=");
   assertSingleGroupChecksum<float>({1, 2, 3}, "b/j7Q4YtV+g=");
   assertSingleGroupChecksum<float>({kNaNF, kNaNF, kNaNF}, "AmWPYoutLK0=");
+  assertSingleGroupChecksum<float>({{-0.0}}, "AAAAAAAAAAA=");
 
   assertGroupingChecksum<int8_t, float>(
       {'a', 'b', 'a'}, {1, 2, 3}, {"Vswv9sY4wxY=", "GSzMTb/0k9E="});
@@ -154,7 +149,7 @@ TEST_F(ChecksumAggregateTest, reals) {
   assertGroupingChecksum<int8_t, float>(
       {1, 1, 2}, {kNaNF, kNaNF, kNaNF}, {"rJhf7Fwec3M=", "Vswvdi6PuTk="});
   assertGroupingChecksum<int8_t, float>(
-      {1, 2}, {0.0, -0.0}, {"AAAAAAAAAAA=", "bAFBcIKzvC4="});
+      {1, 2}, {0.0, -0.0}, {"AAAAAAAAAAA=", "AAAAAAAAAAA="});
 }
 
 TEST_F(ChecksumAggregateTest, dates) {
@@ -375,17 +370,56 @@ TEST_F(ChecksumAggregateTest, globalAggregationNoData) {
 }
 
 TEST_F(ChecksumAggregateTest, timestampWithTimezone) {
-  auto timestamp =
-      makeFlatVector<int64_t>(5, [](auto row) { return 1639426440000; });
-  auto timezone = makeFlatVector<int16_t>(5, [](auto row) { return 0; });
-
-  auto timestampWithTzVector = std::make_shared<RowVector>(
-      pool_.get(),
-      TIMESTAMP_WITH_TIME_ZONE(),
-      BufferPtr(nullptr),
+  auto timestampWithTimezone = makeFlatVector<int64_t>(
       5,
-      std::vector<VectorPtr>{timestamp, timezone});
+      [](auto /* row */) { return pack(1639426440000, 0); },
+      /* isNullAt */ nullptr,
+      TIMESTAMP_WITH_TIME_ZONE());
 
-  assertChecksum(timestampWithTzVector, "jwqENA0VLZY=");
+  assertChecksum(timestampWithTimezone, "jwqENA0VLZY=");
 }
+
+TEST_F(ChecksumAggregateTest, unknown) {
+  auto data = makeAllNullFlatVector<UnknownValue>(100);
+  assertChecksum(data, "vBwbUFiJq80=");
+}
+
+TEST_F(ChecksumAggregateTest, complexVectorWithNulls) {
+  // Create a dictionary on a map vector with null rows.
+  auto baseMap = makeMapVectorFromJson<int32_t, int64_t>({
+      "{1: 10, 2: null, 3: 30}",
+  });
+
+  auto dictionarySize = baseMap->size() * 3;
+  // Set bad index for null value.
+  auto indexBuffer = makeIndices(dictionarySize, [baseMap](auto row) {
+    return row % 7 == 0 ? -1000 : row % baseMap->size();
+  });
+  auto nulls = makeNulls(dictionarySize, [](auto row) { return row % 7 == 0; });
+  auto dictionary =
+      BaseVector::wrapInDictionary(nulls, indexBuffer, dictionarySize, baseMap);
+
+  auto row = makeRowVector({dictionary});
+
+  assertChecksum(row, "r4PlPOShD0w=");
+
+  // Create a dictionary on a array vector with null rows.
+  auto baseArray = makeArrayVectorFromJson<int64_t>({
+      "[1, 2, null, 3, 4]",
+  });
+
+  dictionarySize = baseArray->size() * 3;
+  // Set bad index for null value.
+  indexBuffer = makeIndices(dictionarySize, [baseArray](auto row) {
+    return row % 7 == 0 ? -1000 : row % baseArray->size();
+  });
+  nulls = makeNulls(dictionarySize, [](auto row) { return row % 7 == 0; });
+  dictionary = BaseVector::wrapInDictionary(
+      nulls, indexBuffer, dictionarySize, baseArray);
+
+  row = makeRowVector({dictionary});
+
+  assertChecksum(row, "i5mk/hSs+AQ=");
+}
+
 } // namespace facebook::velox::aggregate::test

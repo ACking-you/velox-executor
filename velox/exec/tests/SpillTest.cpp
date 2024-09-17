@@ -108,7 +108,7 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
     batchesByPartition_.clear();
     values_.clear();
     runtimeStats_.clear();
-    stats_.wlock()->reset();
+    spillStats_.wlock()->reset();
 
     fileNamePrefix_ = "test";
     values_.resize(numBatches * numRowsPerBatch);
@@ -155,9 +155,9 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
     // vectors have the ith element = i * 'numBatches' + batch, where batch is
     // the batch number of the vector in the partition. When read back, both
     // partitions produce an ascending sequence of integers without gaps.
-    stats_.wlock()->reset();
+    spillStats_.wlock()->reset();
     state_ = std::make_unique<SpillState>(
-        [&]() -> const std::string& { return tempDir_->path; },
+        [&]() -> const std::string& { return tempDir_->getPath(); },
         updateSpilledBytesCb_,
         fileNamePrefix_,
         numPartitions,
@@ -167,16 +167,17 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
         writeBufferSize,
         compressionKind_,
         pool(),
-        &stats_);
+        &spillStats_);
     ASSERT_EQ(targetFileSize, state_->targetFileSize());
     ASSERT_EQ(numPartitions, state_->maxPartitions());
-    ASSERT_EQ(stats_.rlock()->spilledPartitions, 0);
-    ASSERT_EQ(stats_.rlock()->spilledPartitions, 0);
+    ASSERT_EQ(spillStats_.rlock()->spilledPartitions, 0);
+    ASSERT_EQ(spillStats_.rlock()->spilledPartitions, 0);
     ASSERT_TRUE(state_->spilledPartitionSet().empty());
     ASSERT_EQ(compressionKind_, state_->compressionKind());
 
     for (auto partition = 0; partition < state_->maxPartitions(); ++partition) {
       ASSERT_FALSE(state_->isPartitionSpilled(partition));
+      ASSERT_EQ(state_->numFinishedFiles(partition), 0);
       // Expect an exception if partition is not set to spill.
       {
         RowVectorPtr dummyInput;
@@ -224,14 +225,16 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
         ASSERT_TRUE(
             state_->testingNonEmptySpilledPartitionSet().contains(partition));
 
+        ASSERT_GE(state_->numFinishedFiles(partition), 0);
         // Indicates that the next additions to 'partition' are not sorted
         // with respect to the values added so far.
         state_->finishFile(partition);
+        ASSERT_GE(state_->numFinishedFiles(partition), 1);
         ASSERT_TRUE(
             state_->testingNonEmptySpilledPartitionSet().contains(partition));
       }
     }
-    ASSERT_EQ(stats_.rlock()->spilledPartitions, numPartitions);
+    ASSERT_EQ(spillStats_.rlock()->spilledPartitions, numPartitions);
     for (int i = 0; i < numPartitions; ++i) {
       ASSERT_TRUE(state_->spilledPartitionSet().contains(i));
     }
@@ -244,10 +247,15 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
     if (targetFileSize > 1) {
       expectedFiles /= 2;
     }
-    ASSERT_EQ(stats_.rlock()->spilledFiles, expectedFiles);
+    ASSERT_EQ(spillStats_.rlock()->spilledFiles, expectedFiles);
     ASSERT_GT(
-        stats_.rlock()->spilledBytes,
+        spillStats_.rlock()->spilledBytes,
         numPartitions * numBatches * sizeof(int64_t));
+    int numFinishedFiles{0};
+    for (int partition = 0; partition < numPartitions; ++partition) {
+      numFinishedFiles += state_->numFinishedFiles(partition);
+    }
+    ASSERT_EQ(numFinishedFiles, expectedFiles);
   }
 
   // 'numDuplicates' specifies the number of duplicates generated for each
@@ -278,17 +286,19 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
         numRowsPerBatch,
         numDuplicates,
         compareFlags);
-    const auto stats = stats_.copy();
+    const auto stats = spillStats_.copy();
     ASSERT_EQ(stats.spilledPartitions, numPartitions);
     ASSERT_EQ(stats.spilledFiles, expectedNumSpilledFiles);
     ASSERT_GT(stats.spilledBytes, 0);
-    ASSERT_GT(stats.spillDiskWrites, 0);
-    ASSERT_GT(stats.spillWriteTimeUs, 0);
-    ASSERT_GE(stats.spillFlushTimeUs, 0);
+    ASSERT_GT(stats.spillWrites, 0);
+    // NOTE: On fast machines we might have sub-microsecond in each write,
+    // resulting in 0us total write time.
+    ASSERT_GE(stats.spillWriteTimeNanos, 0);
+    ASSERT_GE(stats.spillFlushTimeNanos, 0);
     ASSERT_GT(stats.spilledRows, 0);
     // NOTE: the following stats are not collected by spill state.
-    ASSERT_EQ(stats.spillFillTimeUs, 0);
-    ASSERT_EQ(stats.spillSortTimeUs, 0);
+    ASSERT_EQ(stats.spillFillTimeNanos, 0);
+    ASSERT_EQ(stats.spillSortTimeNanos, 0);
     const auto newGStats = common::globalSpillStats();
     ASSERT_EQ(
         prevGStats.spilledPartitions + stats.spilledPartitions,
@@ -298,22 +308,21 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
     ASSERT_EQ(
         prevGStats.spilledBytes + stats.spilledBytes, newGStats.spilledBytes);
     ASSERT_EQ(
-        prevGStats.spillDiskWrites + stats.spillDiskWrites,
-        newGStats.spillDiskWrites);
+        prevGStats.spillWrites + stats.spillWrites, newGStats.spillWrites);
     ASSERT_EQ(
-        prevGStats.spillWriteTimeUs + stats.spillWriteTimeUs,
-        newGStats.spillWriteTimeUs);
+        prevGStats.spillWriteTimeNanos + stats.spillWriteTimeNanos,
+        newGStats.spillWriteTimeNanos);
     ASSERT_EQ(
-        prevGStats.spillFlushTimeUs + stats.spillFlushTimeUs,
-        newGStats.spillFlushTimeUs);
+        prevGStats.spillFlushTimeNanos + stats.spillFlushTimeNanos,
+        newGStats.spillFlushTimeNanos);
     ASSERT_EQ(
         prevGStats.spilledRows + stats.spilledRows, newGStats.spilledRows);
     ASSERT_EQ(
-        prevGStats.spillFillTimeUs + stats.spillFillTimeUs,
-        newGStats.spillFillTimeUs);
+        prevGStats.spillFillTimeNanos + stats.spillFillTimeNanos,
+        newGStats.spillFillTimeNanos);
     ASSERT_EQ(
-        prevGStats.spillSortTimeUs + stats.spillSortTimeUs,
-        newGStats.spillSortTimeUs);
+        prevGStats.spillSortTimeNanos + stats.spillSortTimeNanos,
+        newGStats.spillSortTimeNanos);
 
     // Verifies the spill file id
     for (auto& partitionNum : state_->spilledPartitionSet()) {
@@ -330,7 +339,7 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
     ASSERT_EQ(expectedNumSpilledFiles, spilledFileSet.size());
     // Verify the spilled file exist on file system.
     std::shared_ptr<FileSystem> fs =
-        filesystems::getFileSystem(tempDir_->path, nullptr);
+        filesystems::getFileSystem(tempDir_->getPath(), nullptr);
     uint64_t totalFileBytes{0};
     for (const auto& spilledFile : spilledFileSet) {
       auto readFile = fs->openFileForRead(spilledFile);
@@ -342,9 +351,11 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
 
     for (auto partition = 0; partition < state_->maxPartitions(); ++partition) {
       auto spillFiles = state_->finish(partition);
+      ASSERT_EQ(state_->numFinishedFiles(partition), 0);
       auto spillPartition =
           SpillPartition(SpillPartitionId{0, partition}, std::move(spillFiles));
-      auto merge = spillPartition.createOrderedReader(pool());
+      auto merge =
+          spillPartition.createOrderedReader(1 << 20, pool(), &spillStats_);
       int numReadBatches = 0;
       // We expect all the rows in dense increasing order.
       for (auto i = 0; i < numBatches * numRowsPerBatch; ++i) {
@@ -381,24 +392,36 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
       ASSERT_EQ(numBatches, numReadBatches);
     }
 
-    const auto finalStats = stats_.copy();
+    const auto finalStats = spillStats_.copy();
+    ASSERT_EQ(finalStats.spillReadBytes, finalStats.spilledBytes);
+    ASSERT_GT(finalStats.spillReads, 0);
+    ASSERT_GT(finalStats.spillReadTimeNanos, 0);
+    ASSERT_GT(finalStats.spillDeserializationTimeNanos, 0);
     ASSERT_EQ(
         finalStats.toString(),
         fmt::format(
-            "spillRuns[{}] spilledInputBytes[{}] spilledBytes[{}] spilledRows[{}] spilledPartitions[{}] spilledFiles[{}] spillFillTimeUs[{}] spillSortTime[{}] spillSerializationTime[{}] spillDiskWrites[{}] spillFlushTime[{}] spillWriteTime[{}] maxSpillExceededLimitCount[0]",
+            "spillRuns[{}] spilledInputBytes[{}] spilledBytes[{}] spilledRows[{}] "
+            "spilledPartitions[{}] spilledFiles[{}] spillFillTimeNanos[{}] "
+            "spillSortTimeNanos[{}] spillSerializationTimeNanos[{}] spillWrites[{}] "
+            "spillFlushTimeNanos[{}] spillWriteTimeNanos[{}] maxSpillExceededLimitCount[0] "
+            "spillReadBytes[{}] spillReads[{}] spillReadTimeNanos[{}] "
+            "spillReadDeserializationTimeNanos[{}]",
             finalStats.spillRuns,
             succinctBytes(finalStats.spilledInputBytes),
             succinctBytes(finalStats.spilledBytes),
             finalStats.spilledRows,
             finalStats.spilledPartitions,
             finalStats.spilledFiles,
-            succinctMicros(finalStats.spillFillTimeUs),
-            succinctMicros(finalStats.spillSortTimeUs),
-            succinctMicros(finalStats.spillSerializationTimeUs),
-            finalStats.spillDiskWrites,
-            succinctMicros(finalStats.spillFlushTimeUs),
-            succinctMicros(finalStats.spillWriteTimeUs)));
-
+            succinctNanos(finalStats.spillFillTimeNanos),
+            succinctNanos(finalStats.spillSortTimeNanos),
+            succinctNanos(finalStats.spillSerializationTimeNanos),
+            finalStats.spillWrites,
+            succinctNanos(finalStats.spillFlushTimeNanos),
+            succinctNanos(finalStats.spillWriteTimeNanos),
+            succinctBytes(finalStats.spillReadBytes),
+            finalStats.spillReads,
+            succinctNanos(finalStats.spillReadTimeNanos),
+            succinctNanos(finalStats.spillDeserializationTimeNanos)));
     // Verify the spilled files are still there after spill state destruction.
     for (const auto& spilledFile : spilledFileSet) {
       ASSERT_TRUE(fs->exists(spilledFile));
@@ -414,7 +437,7 @@ class SpillTest : public ::testing::TestWithParam<common::CompressionKind>,
   std::vector<std::optional<int64_t>> values_;
   std::vector<std::vector<RowVectorPtr>> batchesByPartition_;
   std::string fileNamePrefix_;
-  folly::Synchronized<common::SpillStats> stats_;
+  folly::Synchronized<common::SpillStats> spillStats_;
   std::unique_ptr<SpillState> state_;
   std::unordered_map<std::string, RuntimeMetric> runtimeStats_;
   std::unique_ptr<TestRuntimeStatWriter> statWriter_;
@@ -445,7 +468,7 @@ TEST_P(SpillTest, spillTimestamp) {
   // read back.
   auto tempDirectory = exec::test::TempDirectoryPath::create();
   std::vector<CompareFlags> emptyCompareFlags;
-  const std::string spillPath = tempDirectory->path + "/test";
+  const std::string spillPath = tempDirectory->getPath() + "/test";
   std::vector<Timestamp> timeValues = {
       Timestamp{0, 0},
       Timestamp{12, 0},
@@ -456,7 +479,7 @@ TEST_P(SpillTest, spillTimestamp) {
       Timestamp{Timestamp::kMinSeconds, 0}};
 
   SpillState state(
-      [&]() -> const std::string& { return tempDirectory->path; },
+      [&]() -> const std::string& { return tempDirectory->getPath(); },
       updateSpilledBytesCb_,
       "test",
       1,
@@ -466,7 +489,7 @@ TEST_P(SpillTest, spillTimestamp) {
       0,
       compressionKind_,
       pool(),
-      &stats_);
+      &spillStats_);
   int partitionIndex = 0;
   state.setPartitionSpilled(partitionIndex);
   ASSERT_TRUE(state.isPartitionSpilled(partitionIndex));
@@ -479,9 +502,12 @@ TEST_P(SpillTest, spillTimestamp) {
       state.testingNonEmptySpilledPartitionSet().contains(partitionIndex));
 
   SpillPartition spillPartition(SpillPartitionId{0, 0}, state.finish(0));
-  auto merge = spillPartition.createOrderedReader(pool());
+  auto merge =
+      spillPartition.createOrderedReader(1 << 20, pool(), &spillStats_);
   ASSERT_TRUE(merge != nullptr);
-  ASSERT_TRUE(spillPartition.createOrderedReader(pool()) == nullptr);
+  ASSERT_TRUE(
+      spillPartition.createOrderedReader(1 << 20, pool(), &spillStats_) ==
+      nullptr);
   for (auto i = 0; i < timeValues.size(); ++i) {
     auto* stream = merge->next();
     ASSERT_NE(stream, nullptr);
@@ -583,7 +609,8 @@ TEST_P(SpillTest, spillPartitionSet) {
           fmt::format(
               "SPILLED PARTITION[ID:{} FILES:0 SIZE:0B]", id.toString()));
       // Expect an empty reader.
-      auto reader = spillPartitions.back()->createUnorderedReader(pool());
+      auto reader = spillPartitions.back()->createUnorderedReader(
+          1 << 20, pool(), &spillStats_);
       ASSERT_FALSE(reader->nextBatch(output));
     }
 
@@ -655,7 +682,8 @@ TEST_P(SpillTest, spillPartitionSet) {
               i,
               expectedPartitionFiles[i],
               succinctBytes(expectedPartitionSizes[i])));
-      auto reader = spillPartitions[i]->createUnorderedReader(pool());
+      auto reader = spillPartitions[i]->createUnorderedReader(
+          1 << 20, pool(), &spillStats_);
       for (int j = 0; j < numBatchesPerPartition; ++j) {
         ASSERT_TRUE(reader->nextBatch(output));
         for (int row = 0; row < numRowsPerBatch; ++row) {
@@ -669,7 +697,8 @@ TEST_P(SpillTest, spillPartitionSet) {
     // Check spill partition state after creating the reader.
     ASSERT_EQ(0, spillPartitions[i]->numFiles());
     {
-      auto reader = spillPartitions[i]->createUnorderedReader(pool());
+      auto reader = spillPartitions[i]->createUnorderedReader(
+          1 << 20, pool(), &spillStats_);
       ASSERT_FALSE(reader->nextBatch(output));
     }
   }
@@ -715,7 +744,8 @@ TEST_P(SpillTest, spillPartitionSpilt) {
     // Read verification.
     int batchIdx = 0;
     for (int32_t i = 0; i < numShards; ++i) {
-      auto reader = spillPartitionShards[i]->createUnorderedReader(pool());
+      auto reader = spillPartitionShards[i]->createUnorderedReader(
+          1 << 20, pool(), &spillStats_);
       RowVectorPtr output;
       while (reader->nextBatch(output)) {
         for (int row = 0; row < numRowsPerBatch; ++row) {
@@ -739,6 +769,99 @@ TEST_P(SpillTest, nonExistSpillFileOnDeletion) {
   // test.
   tempDir_.reset();
   state_.reset();
+}
+
+namespace {
+SpillFiles makeFakeSpillFiles(int32_t numFiles) {
+  auto tempDir = exec::test::TempDirectoryPath::create();
+  static uint32_t fakeFileId{0};
+  SpillFiles files;
+  files.reserve(numFiles);
+  const std::string filePathPrefix = tempDir->getPath() + "/Spill";
+  for (int32_t i = 0; i < numFiles; ++i) {
+    const auto fileId = fakeFileId;
+    files.push_back(
+        {fileId,
+         ROW({"k1", "k2"}, {BIGINT(), BIGINT()}),
+         tempDir->getPath() + "/Spill_" + std::to_string(fileId),
+         1024,
+         1,
+         std::vector<CompareFlags>({}),
+         common::CompressionKind_NONE});
+  }
+  return files;
+}
+} // namespace
+
+TEST(SpillTest, removeEmptyPartitions) {
+  SpillPartitionSet partitionSet;
+  const int32_t partitionOffset = 8;
+  const int32_t numPartitions = 8;
+
+  for (int32_t partition = 0; partition < numPartitions; ++partition) {
+    const SpillPartitionId id(partitionOffset, partition);
+    if (partition & 0x01) {
+      partitionSet.emplace(
+          id,
+          std::make_unique<SpillPartition>(
+              id, makeFakeSpillFiles(1 + partition / 2)));
+    } else {
+      partitionSet.emplace(id, std::make_unique<SpillPartition>(id));
+    }
+  }
+  ASSERT_EQ(partitionSet.size(), numPartitions);
+
+  removeEmptyPartitions(partitionSet);
+  ASSERT_EQ(partitionSet.size(), numPartitions / 2);
+
+  for (int32_t partition = 0; partition < numPartitions / 2; ++partition) {
+    const int32_t partitionNum = partition * 2 + 1;
+    const SpillPartitionId id(partitionOffset, partitionNum);
+    ASSERT_EQ(partitionSet.at(id)->id().partitionBitOffset(), partitionOffset);
+    ASSERT_EQ(partitionSet.at(id)->id().partitionNumber(), partitionNum);
+    ASSERT_EQ(partitionSet.at(id)->numFiles(), 1 + partitionNum / 2);
+  }
+}
+
+TEST(SpillTest, scopedSpillInjectionRegex) {
+  {
+    TestScopedSpillInjection scopedSpillInjection(100, ".*?(TableWrite).*");
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite.hive-xyz"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite-hive-xyz"));
+    ASSERT_FALSE(testingTriggerSpill("op.1.0.0.RowNumber"));
+    ASSERT_TRUE(testingTriggerSpill(""));
+  }
+
+  {
+    TestScopedSpillInjection scopedSpillInjection(
+        100, ".*?(RowNumber|TableWrite|HashBuild).*");
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.RowNumber"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite.hive-xyz"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite-hive-xyz"));
+    ASSERT_TRUE(testingTriggerSpill("op.1..0.HashBuild"));
+    ASSERT_FALSE(testingTriggerSpill("op.1.0.0.Aggregation"));
+    ASSERT_TRUE(testingTriggerSpill(""));
+  }
+
+  {
+    TestScopedSpillInjection scopedSpillInjection(
+        100, R"(.*?(RowNumber|TableWrite|HashBuild)(?:\..*)?)");
+    ASSERT_TRUE(testingTriggerSpill("op.1.RowNumber"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite.hive-xyz"));
+    ASSERT_FALSE(testingTriggerSpill("op.1.0.0.TableWrite-hive-xyz"));
+    ASSERT_FALSE(testingTriggerSpill("op.1.0.0.Aggregation"));
+    ASSERT_TRUE(testingTriggerSpill(""));
+  }
+
+  {
+    TestScopedSpillInjection scopedSpillInjection(100);
+    ASSERT_TRUE(testingTriggerSpill("op.1.RowNumber"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite.hive-xyz"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.TableWrite-hive-xyz"));
+    ASSERT_TRUE(testingTriggerSpill("op.1.0.0.Aggregation"));
+    ASSERT_TRUE(testingTriggerSpill());
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -16,10 +16,14 @@
 
 #pragma once
 
+#include <charconv>
 #include <string>
 #include "velox/common/base/CheckedArithmetic.h"
+#include "velox/common/base/CountBits.h"
+#include "velox/common/base/Doubles.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Nulls.h"
+#include "velox/common/base/Status.h"
 #include "velox/type/Type.h"
 
 namespace facebook::velox {
@@ -146,12 +150,13 @@ class DecimalUtil {
   }
 
   template <typename TInput, typename TOutput>
-  inline static std::optional<TOutput> rescaleWithRoundUp(
+  inline static Status rescaleWithRoundUp(
       TInput inputValue,
       int fromPrecision,
       int fromScale,
       int toPrecision,
-      int toScale) {
+      int toScale,
+      TOutput& output) {
     int128_t rescaledValue = inputValue;
     auto scaleDifference = toScale - fromScale;
     bool isOverflow = false;
@@ -173,13 +178,14 @@ class DecimalUtil {
     }
     // Check overflow.
     if (!valueInPrecisionRange(rescaledValue, toPrecision) || isOverflow) {
-      VELOX_USER_FAIL(
+      return Status::UserError(
           "Cannot cast DECIMAL '{}' to DECIMAL({}, {})",
           DecimalUtil::toString(inputValue, DECIMAL(fromPrecision, fromScale)),
           toPrecision,
           toScale);
     }
-    return static_cast<TOutput>(rescaledValue);
+    output = static_cast<TOutput>(rescaledValue);
+    return Status::OK();
   }
 
   template <typename TInput, typename TOutput>
@@ -200,6 +206,77 @@ class DecimalUtil {
     return static_cast<TOutput>(rescaledValue);
   }
 
+  /// Rescales a floating point value to decimal value of given precision and
+  /// scale. Returns error status if fails.
+  /// @tparam TInput Either float or double.
+  /// @tparam TOutput Either int64_t or int128_t.
+  template <typename TInput, typename TOutput>
+  inline static Status rescaleFloatingPoint(
+      TInput value,
+      int precision,
+      int scale,
+      TOutput& output) {
+    if (!std::isfinite(value)) {
+      return Status::UserError("The input value should be finite.");
+    }
+
+    TInput maxValue;
+    if constexpr (std::is_same_v<TOutput, int64_t>) {
+      maxValue = kMaxDoubleBelowInt64Max;
+    } else {
+      maxValue = kMaxDoubleBelowInt128Max;
+    }
+
+    if (value <= std::numeric_limits<TOutput>::min() || value > maxValue) {
+      return Status::UserError("Result overflows.");
+    }
+
+    uint8_t digits;
+    if constexpr (std::is_same_v<TInput, float>) {
+      // A float provides between 6 and 7 decimal digits, so at least 6 digits
+      // are precise.
+      digits = 6;
+    } else {
+      // A double provides from 15 to 17 decimal digits, so at least 15 digits
+      // are precise.
+      digits = 15;
+    }
+
+    // Calculate the precise fractional digits.
+    const auto integralValue = static_cast<uint128_t>(std::abs(value));
+    const auto integralDigits =
+        integralValue == 0 ? 0 : countDigits(integralValue);
+    const auto fractionDigits = std::max(digits - integralDigits, 0);
+
+    // Scales up the input value with all the precise fractional digits kept.
+    // Convert value as long double type because 1) double * int128_t returns
+    // int128_t and fractional digits are lost. 2) we could also convert the
+    // int128_t value as double to avoid 'double * int128_t', but double
+    // multiplication gives inaccurate result on large numbers. For example,
+    // -3333030000000000000 * 1e3 = -3333030000000000065536. No need to
+    // consider the result becoming infinite as DOUBLE_MAX * 10^38 <
+    // LONG_DOUBLE_MAX.
+    long double scaledValue = std::round(
+        (long double)value * DecimalUtil::kPowersOfTen[fractionDigits]);
+    if (scale > fractionDigits) {
+      scaledValue *= DecimalUtil::kPowersOfTen[scale - fractionDigits];
+    } else {
+      scaledValue /= DecimalUtil::kPowersOfTen[fractionDigits - scale];
+    }
+
+    const auto result = folly::tryTo<TOutput>(std::round(scaledValue));
+    if (result.hasError()) {
+      return Status::UserError("Result overflows.");
+    }
+    const TOutput rescaledValue = result.value();
+    if (!valueInPrecisionRange<TOutput>(rescaledValue, precision)) {
+      return Status::UserError(
+          "Result cannot fit in the given precision {}.", precision);
+    }
+    output = rescaledValue;
+    return Status::OK();
+  }
+
   template <typename R, typename A, typename B>
   inline static R divideWithRoundUp(
       R& r,
@@ -210,7 +287,7 @@ class DecimalUtil {
       uint8_t /*bRescale*/) {
     VELOX_USER_CHECK_NE(b, 0, "Division by zero");
     int resultSign = 1;
-    A unsignedDividendRescaled(a);
+    R unsignedDividendRescaled(a);
     if (a < 0) {
       resultSign = -1;
       unsignedDividendRescaled *= -1;
@@ -231,6 +308,71 @@ class DecimalUtil {
     }
     r = quotient * resultSign;
     return remainder * resultSign;
+  }
+
+  /// Returns the max required size to convert the decimal of this precision and
+  /// scale to varchar. A varchar's size is estimated with unscaled value
+  /// digits, dot, leading zero, and possible minus sign.
+  static int32_t maxStringViewSize(int precision, int scale);
+
+  /// @brief Convert the unscaled value of a decimal to string and write to raw
+  /// string buffer from start position.
+  /// @tparam T The type of input value.
+  /// @param unscaledValue The input unscaled value.
+  /// @param scale The scale of decimal.
+  /// @param maxSize The estimated max size of string.
+  /// @param startPosition The start position to write from.
+  /// @return The actual size of the string.
+  template <typename T>
+  static size_t castToString(
+      T unscaledValue,
+      int32_t scale,
+      int32_t maxSize,
+      char* const startPosition) {
+    char* writePosition = startPosition;
+    if (unscaledValue == 0) {
+      *writePosition++ = '0';
+      if (scale > 0) {
+        *writePosition++ = '.';
+        // Append trailing zeros.
+        std::memset(writePosition, '0', scale);
+        writePosition += scale;
+      }
+    } else {
+      if (unscaledValue < 0) {
+        *writePosition++ = '-';
+        unscaledValue = -unscaledValue;
+      }
+      auto [position, errorCode] = std::to_chars(
+          writePosition,
+          writePosition + maxSize,
+          unscaledValue / DecimalUtil::kPowersOfTen[scale]);
+      VELOX_DCHECK_EQ(
+          errorCode,
+          std::errc(),
+          "Failed to cast decimal to varchar: {}",
+          std::make_error_code(errorCode).message());
+      writePosition = position;
+
+      if (scale > 0) {
+        *writePosition++ = '.';
+        uint128_t fraction = unscaledValue % DecimalUtil::kPowersOfTen[scale];
+        // Append leading zeros.
+        int numLeadingZeros = std::max(scale - countDigits(fraction), 0);
+        std::memset(writePosition, '0', numLeadingZeros);
+        writePosition += numLeadingZeros;
+        // Append remaining fraction digits.
+        auto result =
+            std::to_chars(writePosition, writePosition + maxSize, fraction);
+        VELOX_DCHECK_EQ(
+            result.ec,
+            std::errc(),
+            "Failed to cast decimal to varchar: {}",
+            std::make_error_code(result.ec).message());
+        writePosition = result.ptr;
+      }
+    }
+    return writePosition - startPosition;
   }
 
   /*

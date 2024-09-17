@@ -44,6 +44,24 @@ class MicrosecondTimer {
   uint64_t* timer_;
 };
 
+class NanosecondTimer {
+ public:
+  explicit NanosecondTimer(uint64_t* timer) : timer_(timer) {
+    start_ = std::chrono::steady_clock::now();
+  }
+
+  ~NanosecondTimer() {
+    auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start_);
+
+    (*timer_) += duration.count();
+  }
+
+ private:
+  std::chrono::steady_clock::time_point start_;
+  uint64_t* timer_;
+};
+
 /// Measures the time between construction and destruction with CPU clock
 /// counter (rdtsc on X86) and increments a user-supplied counter with the cycle
 /// count.
@@ -78,28 +96,5 @@ size_t getCurrentTimeMs();
 
 /// Returns the current epoch time in microseconds.
 size_t getCurrentTimeMicro();
-
-#ifndef NDEBUG
-// Used to override the current time for testing purposes.
-class ScopedTestTime {
- public:
-  ScopedTestTime();
-  ~ScopedTestTime();
-
-  void setCurrentTestTimeSec(size_t currentTimeSec);
-  void setCurrentTestTimeMs(size_t currentTimeMs);
-  void setCurrentTestTimeMicro(size_t currentTimeUs);
-
-  static std::optional<size_t> getCurrentTestTimeSec();
-  static std::optional<size_t> getCurrentTestTimeMs();
-  static std::optional<size_t> getCurrentTestTimeMicro();
-
- private:
-  // Used to verify only one instance of ScopedTestTime exists at a time.
-  static bool enabled_;
-  // The overridden value of current time only.
-  static std::optional<size_t> testTimeUs_;
-};
-#endif
 
 } // namespace facebook::velox

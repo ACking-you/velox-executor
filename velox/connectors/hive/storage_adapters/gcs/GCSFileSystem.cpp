@@ -15,10 +15,12 @@
  */
 
 #include "velox/connectors/hive/storage_adapters/gcs/GCSFileSystem.h"
+#include "velox/common/base/Exceptions.h"
+#include "velox/common/config/Config.h"
 #include "velox/common/file/File.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/storage_adapters/gcs/GCSUtil.h"
-#include "velox/core/Config.h"
+#include "velox/core/QueryConfig.h"
 
 #include <fmt/format.h>
 #include <glog/logging.h>
@@ -47,14 +49,17 @@ inline void checkGCSStatus(
     const std::string& bucket,
     const std::string& key) {
   if (!outcome.ok()) {
-    auto error = outcome.error_info();
-    VELOX_FAIL(
+    const auto errMsg = fmt::format(
         "{} due to: Path:'{}', SDK Error Type:{}, GCS Status Code:{},  Message:'{}'",
         errorMsgPrefix,
         gcsURI(bucket, key),
-        error.domain(),
+        outcome.error_info().domain(),
         getErrorStringFromGCSError(outcome.code()),
         outcome.message());
+    if (outcome.code() == gc::StatusCode::kNotFound) {
+      VELOX_FILE_NOT_FOUND_ERROR(errMsg);
+    }
+    VELOX_FAIL(errMsg);
   }
 }
 
@@ -68,7 +73,13 @@ class GCSReadFile final : public ReadFile {
 
   // Gets the length of the file.
   // Checks if there are any issues reading the file.
-  void initialize() {
+  void initialize(const filesystems::FileOptions& options) {
+    if (options.fileSize.has_value()) {
+      VELOX_CHECK_GE(
+          options.fileSize.value(), 0, "File size must be non-negative");
+      length_ = options.fileSize.value();
+    }
+
     // Make it a no-op if invoked twice.
     if (length_ != -1) {
       return;
@@ -247,9 +258,9 @@ auto constexpr kGCSInvalidPath = "File {} is not a valid gcs file";
 
 class GCSFileSystem::Impl {
  public:
-  Impl(const Config* config)
+  Impl(const config::ConfigBase* config)
       : hiveConfig_(std::make_shared<HiveConfig>(
-            std::make_shared<core::MemConfig>(config->values()))) {}
+            std::make_shared<config::ConfigBase>(config->rawConfigsCopy()))) {}
 
   ~Impl() = default;
 
@@ -264,6 +275,20 @@ class GCSFileSystem::Impl {
       options.set<gc::UnifiedCredentialsOption>(gc::MakeInsecureCredentials());
     }
     options.set<gcs::UploadBufferSizeOption>(kUploadBufferSize);
+
+    auto max_retry_count = hiveConfig_->gcsMaxRetryCount();
+    if (max_retry_count) {
+      options.set<gcs::RetryPolicyOption>(
+          gcs::LimitedErrorCountRetryPolicy(max_retry_count.value()).clone());
+    }
+
+    auto max_retry_time = hiveConfig_->gcsMaxRetryTime();
+    if (max_retry_time) {
+      auto retry_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+          facebook::velox::config::toDuration(max_retry_time.value()));
+      options.set<gcs::RetryPolicyOption>(
+          gcs::LimitedTimeRetryPolicy(retry_time).clone());
+    }
 
     auto endpointOverride = hiveConfig_->gcsEndpoint();
     if (!endpointOverride.empty()) {
@@ -290,7 +315,7 @@ class GCSFileSystem::Impl {
   std::shared_ptr<gcs::Client> client_;
 };
 
-GCSFileSystem::GCSFileSystem(std::shared_ptr<const Config> config)
+GCSFileSystem::GCSFileSystem(std::shared_ptr<const config::ConfigBase> config)
     : FileSystem(config) {
   impl_ = std::make_shared<Impl>(config.get());
 }
@@ -301,10 +326,10 @@ void GCSFileSystem::initializeClient() {
 
 std::unique_ptr<ReadFile> GCSFileSystem::openFileForRead(
     std::string_view path,
-    const FileOptions& /*unused*/) {
+    const FileOptions& options) {
   const auto gcspath = gcsPath(path);
   auto gcsfile = std::make_unique<GCSReadFile>(gcspath, impl_->getClient());
-  gcsfile->initialize();
+  gcsfile->initialize(options);
   return gcsfile;
 }
 
@@ -402,5 +427,5 @@ void GCSFileSystem::rmdir(std::string_view path) {
   VELOX_UNSUPPORTED("rmdir for GCS not implemented");
 }
 
-}; // namespace filesystems
-}; // namespace facebook::velox
+} // namespace filesystems
+} // namespace facebook::velox

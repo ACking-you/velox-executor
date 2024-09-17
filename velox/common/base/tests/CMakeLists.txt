@@ -18,13 +18,14 @@ add_executable(
   BitUtilTest.cpp
   BloomFilterTest.cpp
   CoalesceIoTest.cpp
+  ConcurrentCounterTest.cpp
   ExceptionTest.cpp
   FsTest.cpp
   RangeTest.cpp
   RawVectorTest.cpp
-  ScratchTest.cpp
   RuntimeMetricsTest.cpp
   ScopedLockTest.cpp
+  ScratchTest.cpp
   SemaphoreTest.cpp
   SimdUtilTest.cpp
   SpillConfigTest.cpp
@@ -37,19 +38,22 @@ add_test(velox_base_test velox_base_test)
 
 target_link_libraries(
   velox_base_test
-  PRIVATE velox_common_base
-          velox_time
-          velox_status
-          velox_exception
-          velox_temp_path
-          Boost::filesystem
-          Boost::headers
-          Folly::folly
-          fmt::fmt
-          gflags::gflags
-          gtest
-          gmock
-          gtest_main)
+  PRIVATE
+    velox_caching
+    velox_common_base
+    velox_memory
+    velox_time
+    velox_status
+    velox_exception
+    velox_temp_path
+    Boost::filesystem
+    Boost::headers
+    Folly::folly
+    fmt::fmt
+    gflags::gflags
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main)
 
 add_executable(velox_id_map_test IdMapTest.cpp)
 
@@ -63,11 +67,16 @@ target_link_libraries(
   Boost::headers
   gflags::gflags
   glog::glog
-  gtest
-  gtest_main
+  GTest::gtest
+  GTest::gtest_main
   pthread)
 
 add_executable(velox_memcpy_meter Memcpy.cpp)
 target_link_libraries(
-  velox_memcpy_meter PRIVATE velox_common_base velox_exception velox_time
-                             Folly::folly gflags::gflags)
+  velox_memcpy_meter
+  PRIVATE
+    velox_common_base
+    velox_exception
+    velox_time
+    Folly::folly
+    gflags::gflags)

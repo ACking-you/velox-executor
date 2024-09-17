@@ -19,6 +19,7 @@
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/OperatorUtils.h"
+#include "velox/exec/PrefixSort.h"
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/Spill.h"
 #include "velox/vector/BaseVector.h"
@@ -36,8 +37,11 @@ class SortBuffer {
       const std::vector<CompareFlags>& sortCompareFlags,
       velox::memory::MemoryPool* pool,
       tsan_atomic<bool>* nonReclaimableSection,
+      common::PrefixSortConfig prefixSortConfig,
       const common::SpillConfig* spillConfig = nullptr,
-      uint64_t spillMemoryThreshold = 0);
+      folly::Synchronized<velox::common::SpillStats>* spillStats = nullptr);
+
+  ~SortBuffer();
 
   void addInput(const VectorPtr& input);
 
@@ -48,7 +52,7 @@ class SortBuffer {
   void noMoreInput();
 
   /// Returns the sorted output rows in batch.
-  RowVectorPtr getOutput(uint32_t maxOutputRows);
+  RowVectorPtr getOutput(vector_size_t maxOutputRows);
 
   /// Indicates if this sort buffer can spill or not.
   bool canSpill() const {
@@ -62,22 +66,17 @@ class SortBuffer {
     return pool_;
   }
 
-  /// Returns the spiller stats including total bytes and rows spilled so far.
-  std::optional<common::SpillStats> spilledStats() const {
-    if (spiller_ == nullptr) {
-      return std::nullopt;
-    }
-    return spiller_->stats();
-  }
-
   std::optional<uint64_t> estimateOutputRowSize() const;
 
  private:
   // Ensures there is sufficient memory reserved to process 'input'.
   void ensureInputFits(const VectorPtr& input);
+  // Reserves memory for output processing. If reservation cannot be increased,
+  // spills enough to make output fit.
+  void ensureOutputFits();
   void updateEstimatedOutputRowSize();
   // Invoked to initialize or reset the reusable output buffer to get output.
-  void prepareOutput(uint32_t maxOutputRows);
+  void prepareOutput(vector_size_t maxOutputRows);
   void getOutputWithoutSpill();
   void getOutputWithSpill();
   // Spill during input stage.
@@ -95,12 +94,10 @@ class SortBuffer {
   // TableWriter to indicate if this sort buffer object is under non-reclaimable
   // execution section or not.
   tsan_atomic<bool>* const nonReclaimableSection_;
+  // Configuration settings for prefix-sort.
+  const common::PrefixSortConfig prefixSortConfig_;
   const common::SpillConfig* const spillConfig_;
-  // The maximum size that an SortBuffer can hold in memory before spilling.
-  // Zero indicates no limit.
-  //
-  // NOTE: 'spillMemoryThreshold_' only applies if disk spilling is enabled.
-  const uint64_t spillMemoryThreshold_;
+  folly::Synchronized<common::SpillStats>* const spillStats_;
 
   // The column projection map between 'input_' and 'spillerStoreType_' as sort
   // buffer stores the sort columns first in 'data_'.
@@ -110,7 +107,7 @@ class SortBuffer {
   // sort buffer object.
   bool noMoreInput_ = false;
   // The number of received input rows.
-  size_t numInputRows_ = 0;
+  uint64_t numInputRows_ = 0;
   // Used to store the input data in row format.
   std::unique_ptr<RowContainer> data_;
   std::vector<char*> sortedRows_;
@@ -124,8 +121,6 @@ class SortBuffer {
   // Records the source rows to copy to 'output_' in order.
   std::vector<const RowVector*> spillSources_;
   std::vector<vector_size_t> spillSourceRows_;
-  // Counts input batches to trigger spilling for test.
-  uint64_t spillTestCounter_{0};
 
   // Reusable output vector.
   RowVectorPtr output_;
@@ -133,7 +128,7 @@ class SortBuffer {
   // 'data_->estimateRowSize()' across all accumulated data set.
   std::optional<uint64_t> estimatedOutputRowSize_{};
   // The number of rows that has been returned.
-  size_t numOutputRows_{0};
+  uint64_t numOutputRows_{0};
 };
 
 } // namespace facebook::velox::exec

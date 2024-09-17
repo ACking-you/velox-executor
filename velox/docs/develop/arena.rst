@@ -2,7 +2,7 @@
 Arena Allocation
 ================
 
-exec::HashStringAllocator implements an arena backed by MappedMemory::Allocation
+exec::HashStringAllocator implements an arena backed by memory::Allocation
 and supports contiguous and non-contiguous allocations. It is used to store
 variable width accumulators for the aggregate functions, hash tables for joins
 and aggregations. It is also used to back byte streams used to serialize and
@@ -75,11 +75,11 @@ non-contiguous allocation, it frees all the blocks in that allocation.
 
       // Allocates 'size' contiguous bytes preceded by a Header. Returns
       // the address of Header.
-      Header* FOLLY_NONNULL allocate(int32_t size);
+      Header* allocate(int32_t size);
 
       // Adds the allocation of 'header' and any extensions (if header has
       // kContinued set) to the free list.
-      void free(Header* FOLLY_NONNULL header);
+      void free(Header* header);
 
 StlAllocator, an allocator backed by HashStringAllocator that can be used with
 STL containers, is implemented using the above allocate() and free() methods.
@@ -116,7 +116,7 @@ The prepareRead() method allows deserializing the data using ByteInputStream.
     // Sets 'stream' to range over the data in the range of 'header' and
     // possible continuation ranges.
     static void prepareRead(
-        const Header* FOLLY_NONNULL header,
+        const Header* header,
         ByteInputStream& stream);
 
 Examples of Usage

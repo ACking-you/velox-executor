@@ -101,6 +101,15 @@ TEST_F(FindFirstTest, basic) {
   expected =
       makeNullableFlatVector<int64_t>({3, std::nullopt, std::nullopt, 5});
   verify("find_first_index(c0, -2, x -> (x > 0))", data, expected);
+
+  expected = makeNullConstant(TypeKind::INTEGER, 4);
+  verify("find_first(c0, cast(null as INTEGER), x -> (x > 0))", data, expected);
+
+  expected = makeNullConstant(TypeKind::BIGINT, 4);
+  verify(
+      "find_first_index(c0, cast(null as INTEGER), x -> (x > 0))",
+      data,
+      expected);
 }
 
 TEST_F(FindFirstTest, firstMatchIsNull) {
@@ -212,7 +221,7 @@ TEST_F(FindFirstTest, invalidIndex) {
       "SQL array indices start at 1. Got 0.");
 
   // Mark 3rd row null. Expect no error.
-  data->setNull(2, true);
+  data->childAt(1)->setNull(2, true);
   expected = makeAllNullFlatVector<int32_t>(4);
   verify("find_first(c0, c1, x -> (x > 0))", data, expected);
 }

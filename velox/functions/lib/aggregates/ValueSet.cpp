@@ -29,7 +29,8 @@ void ValueSet::write(
     allocator_->extendWrite(position, stream);
   }
 
-  exec::ContainerRowSerde::serialize(vector, index, stream);
+  static const exec::ContainerRowSerdeOptions options{};
+  exec::ContainerRowSerde::serialize(vector, index, stream, options);
   allocator_->finishWrite(stream, 0);
 }
 
@@ -54,7 +55,7 @@ void ValueSet::read(
   VELOX_CHECK_NOT_NULL(header);
 
   auto stream = HashStringAllocator::prepareRead(header);
-  exec::ContainerRowSerde::deserialize(stream, index, vector);
+  exec::ContainerRowSerde::deserialize(*stream, index, vector);
 }
 
 void ValueSet::free(HashStringAllocator::Header* header) const {

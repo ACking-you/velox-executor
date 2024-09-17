@@ -316,12 +316,16 @@ TEST_F(ArrayWriterTest, testVarChar) {
         stringWriter,
         "test a long string, a bit longer than that, longer, and longer");
   }
+
+  arrayWriter.push_back("new_feature"_sv);
+
   vectorWriter.commit();
   auto expected = std::vector<std::vector<std::optional<StringView>>>{
       {"hi"_sv,
        std::nullopt,
        "welcome"_sv,
-       "test a long string, a bit longer than that, longer, and longer"_sv}};
+       "test a long string, a bit longer than that, longer, and longer"_sv,
+       "new_feature"_sv}};
   assertEqualVectors(result, makeNullableArrayVector(expected));
 }
 
@@ -853,7 +857,6 @@ TEST_F(ArrayWriterTest, nestedArrayWriteThenCommitNull) {
     auto& nestedArray = current.add_item();
     nestedArray.push_back(1);
     nestedArray.push_back(2);
-
     writer.commitNull();
   }
 
@@ -970,6 +973,7 @@ using UDT2TypeRegistrar = OpaqueCustomTypeRegister<UDT2, kName>;
 
 TEST_F(ArrayWriterTest, copyFromArrayOfOpaqueUDT) {
   UDT2TypeRegistrar::registerType();
+  auto guard = folly::makeGuard([&] { UDT2TypeRegistrar::unregisterType(); });
 
   using out_t = Array<UDT2TypeRegistrar::SimpleType>;
 
@@ -1017,6 +1021,7 @@ struct CopyFromArrayOfUDTFunc {
 
 TEST_F(ArrayWriterTest, copyFromNestedArrayOfOpaqueUDT) {
   UDT2TypeRegistrar::registerType();
+  auto guard = folly::makeGuard([&] { UDT2TypeRegistrar::unregisterType(); });
   registerFunction<CopyFromArrayOfUDTFunc, copy_from_udt_t>(
       {"copy_udt2_array"});
 
@@ -1056,6 +1061,44 @@ TEST_F(ArrayWriterTest, copyFromNestedArrayOfOpaqueUDT) {
       ASSERT_EQ(*arrayViewInner[0].value().get(), UDT2{4});
     }
   }
+}
+
+// Throws an error if n is even, otherwise creates a 3x3 array filled with n.
+template <typename T>
+struct ThrowsErrorsFunc {
+  template <typename TOut>
+  void call(TOut& out, const int64_t& n) {
+    for (auto i = 0; i < 3; i++) {
+      auto& innerArray = out.add_item();
+      for (auto j = 0; j < 3; j++) {
+        // If commit isn't called as part of error handling, the first inner
+        // array in odd number rows will pick up the elements from the last
+        // inner array of the previous row.
+        innerArray.push_back(n);
+      }
+    }
+
+    VELOX_USER_CHECK_EQ(n % 2, 1);
+  }
+};
+
+TEST_F(ArrayWriterTest, errorHandlingE2E) {
+  registerFunction<ThrowsErrorsFunc, Array<Array<int64_t>>, int64_t>(
+      {"throws_errors"});
+
+  auto result = evaluate(
+      "try(throws_errors(c0))",
+      makeRowVector({makeFlatVector<int64_t>({1, 2, 3, 4, 5, 6})}));
+
+  assertEqualVectors(
+      result,
+      makeNestedArrayVectorFromJson<int64_t>(
+          {"[[1, 1, 1], [1, 1, 1], [1, 1, 1]]",
+           "null",
+           "[[3, 3, 3], [3, 3, 3], [3, 3, 3]]",
+           "null",
+           "[[5, 5, 5], [5, 5, 5], [5, 5, 5]]",
+           "null"}));
 }
 
 } // namespace

@@ -1,4 +1,19 @@
 /*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
  * Copyright owned by the Transaction Processing Performance Council.
  *
  * A copy of the license is included under extension/tpch/dbgen/LICENSE
@@ -147,7 +162,6 @@ struct DBGenContext;
 
 /* bm_utils.c */
 const char* tpch_env_config PROTO((const char* var, const char* dflt));
-long yes_no PROTO((char* prompt));
 void tpch_a_rnd PROTO((int min, int max, seed_t* seed, char* dest));
 int tx_rnd PROTO((long min, long max, long column, char* tgt));
 long julian PROTO((long date));
@@ -543,13 +557,19 @@ struct DBGenContext {
   static constexpr double dM = 2147483647.0;
 
   tdef tdefs[10] = {
-      {"part.tbl", "part table", 200000, NULL, NULL, PSUPP, 0},
-      {"partsupp.tbl", "partsupplier table", 200000, NULL, NULL, NONE, 0},
-      {"supplier.tbl", "suppliers table", 10000, NULL, NULL, NONE, 0},
-      {"customer.tbl", "customers table", 150000, NULL, NULL, NONE, 0},
-      {"orders.tbl", "order table", 150000, NULL, NULL, LINE, 0},
-      {"lineitem.tbl", "lineitem table", 150000, NULL, NULL, NONE, 0},
-      {"orders.tbl", "orders/lineitem tables", 150000, NULL, NULL, LINE, 0},
+      {"part.tbl", "part table", 200000, nullptr, nullptr, PSUPP, 0},
+      {"partsupp.tbl", "partsupplier table", 200000, nullptr, nullptr, NONE, 0},
+      {"supplier.tbl", "suppliers table", 10000, nullptr, nullptr, NONE, 0},
+      {"customer.tbl", "customers table", 150000, nullptr, nullptr, NONE, 0},
+      {"orders.tbl", "order table", 150000, nullptr, nullptr, LINE, 0},
+      {"lineitem.tbl", "lineitem table", 150000, nullptr, nullptr, NONE, 0},
+      {"orders.tbl",
+       "orders/lineitem tables",
+       150000,
+       nullptr,
+       nullptr,
+       LINE,
+       0},
       {"part.tbl", "part/partsupplier tables", 200000, NULL, NULL, PSUPP, 0},
       {"nation.tbl", "nation table", NATIONS_MAX, NULL, NULL, NONE, 0},
       {"region.tbl", "region table", NATIONS_MAX, NULL, NULL, NONE, 0},

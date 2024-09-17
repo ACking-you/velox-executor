@@ -27,7 +27,22 @@ using namespace facebook::velox;
 
 namespace facebook::velox::test {
 
-class QueryAssertionsTest : public OperatorTestBase {};
+class QueryAssertionsTest : public OperatorTestBase {
+ public:
+  void assertQueryWithThreadingConfigs(
+      const core::PlanNodePtr& plan,
+      const std::string& duckDbSql) {
+    CursorParameters parallelParams{};
+    parallelParams.planNode = plan;
+    parallelParams.serialExecution = false;
+    assertQuery(parallelParams, duckDbSql);
+
+    CursorParameters serialParams{};
+    serialParams.planNode = plan;
+    serialParams.serialExecution = true;
+    assertQuery(serialParams, duckDbSql);
+  }
+};
 
 TEST_F(QueryAssertionsTest, basic) {
   auto data = makeRowVector({
@@ -36,7 +51,7 @@ TEST_F(QueryAssertionsTest, basic) {
   createDuckDbTable({data});
 
   auto plan = PlanBuilder().values({data}).project({"c0"}).planNode();
-  assertQuery(plan, "SELECT c0 FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT c0 FROM tmp");
 
   EXPECT_NONFATAL_FAILURE(
       assertQuery(plan, "SELECT c0 + 1 FROM tmp"),
@@ -344,6 +359,81 @@ TEST_F(QueryAssertionsTest, multiFloatColumnWithNonUniqueKeys) {
       "971 extra rows, 971 missing rows");
 }
 
+TEST_F(QueryAssertionsTest, complexTypesContainingFloat) {
+  auto size = 1000;
+  // Test array.
+  auto expected = makeRowVector(
+      {makeArrayVector<float>(
+           size,
+           [](auto /*row*/) { return 2; },
+           [](auto row) { return row % 2 + 0.01; },
+           [](auto row) { return row % 7 == 0; }),
+       makeFlatVector<int64_t>(size, [](auto row) { return row; })});
+  auto actual = makeRowVector(
+      {makeArrayVector<float>(
+           size,
+           [&](auto /*row*/) { return 2; },
+           [&](auto row) {
+             auto value = row % 2 + 0.01;
+             return value + value * FLT_EPSILON;
+           },
+           [&](auto row) { return (size - row - 1) % 7 == 0; }),
+       makeFlatVector<int64_t>(
+           size, [&](auto row) { return size - row - 1; })});
+  EXPECT_TRUE(assertEqualResults({expected}, {actual}));
+
+  // Test map and row.
+  expected = makeRowVector(
+      {makeMapVector<int64_t, float>(
+           size,
+           [](auto /*row*/) { return 2; },
+           [](auto row) { return row; },
+           [](auto row) { return row % 5 + 0.01; },
+           [](auto /*row*/) { return false; },
+           [](auto row) { return row % 6 == 0; }),
+       makeRowVector(
+           {makeFlatVector<float>(
+                size, [](auto row) { return row % 5 + 0.01; }),
+            makeFlatVector<int64_t>(size, [](auto row) { return row % 5; }),
+            makeArrayVector<float>(
+                size,
+                [](auto /*row*/) { return 2; },
+                [](auto row) { return row % 2 + 0.01; },
+                [](auto row) { return row % 7 == 0; })}),
+       makeFlatVector<int64_t>(size, [](auto row) { return row; })});
+  actual = makeRowVector(
+      {makeMapVector<int64_t, float>(
+           size,
+           [](auto /*row*/) { return 2; },
+           [&](auto row) { return (size * 2 - row - 1); },
+           [&](auto row) {
+             auto value = (size * 2 - row - 1) % 5 + 0.01;
+             return value + value * FLT_EPSILON;
+           },
+           [&](auto /*row*/) { return false; },
+           [&](auto row) { return (size * 2 - row - 1) % 6 == 0; }),
+       makeRowVector(
+           {makeFlatVector<float>(
+                size,
+                [&](auto row) {
+                  auto value = (size - row - 1) % 5 + 0.01;
+                  return value + value * FLT_EPSILON;
+                }),
+            makeFlatVector<int64_t>(
+                size, [&](auto row) { return (size - row - 1) % 5; }),
+            makeArrayVector<float>(
+                size,
+                [](auto /*row*/) { return 2; },
+                [&](auto row) {
+                  auto value = row % 2 + 0.01;
+                  return value + value * FLT_EPSILON;
+                },
+                [&](auto row) { return (size - row - 1) % 7 == 0; })}),
+       makeFlatVector<int64_t>(
+           size, [&](auto row) { return (size - row - 1); })});
+  EXPECT_TRUE(assertEqualResults({expected}, {actual}));
+}
+
 TEST_F(QueryAssertionsTest, nullDecimalValue) {
   auto shortDecimal = makeRowVector(
       {makeNullableFlatVector<int64_t>({std::nullopt}, DECIMAL(5, 2))});
@@ -351,7 +441,7 @@ TEST_F(QueryAssertionsTest, nullDecimalValue) {
 
   createDuckDbTable({shortDecimal});
   auto plan = PlanBuilder().values({shortDecimal}).planNode();
-  assertQuery(plan, "SELECT c0 FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT c0 FROM tmp");
 
   auto longDecimal = makeRowVector(
       {makeNullableFlatVector<int128_t>({std::nullopt}, DECIMAL(20, 2))});
@@ -359,7 +449,7 @@ TEST_F(QueryAssertionsTest, nullDecimalValue) {
 
   createDuckDbTable({longDecimal});
   plan = PlanBuilder().values({longDecimal}).planNode();
-  assertQuery(plan, "SELECT c0 FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT c0 FROM tmp");
 
   EXPECT_NONFATAL_FAILURE(
       assertEqualResults({shortDecimal}, {longDecimal}),
@@ -432,7 +522,7 @@ TEST_F(QueryAssertionsTest, nullVariant) {
            {{std::nullopt, 1.1}, {2.2, 3.3, 4.4}, {std::nullopt}})});
   createDuckDbTable({input});
   auto plan = PlanBuilder().values({input}).planNode();
-  assertQuery(plan, "SELECT * FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT * FROM tmp");
 
   input = makeRowVector({makeNullableMapVector<int64_t, double>(
       {std::nullopt,
@@ -443,14 +533,14 @@ TEST_F(QueryAssertionsTest, nullVariant) {
        {{{6, std::nullopt}}}})});
   createDuckDbTable({input});
   plan = PlanBuilder().values({input}).planNode();
-  assertQuery(plan, "SELECT * FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT * FROM tmp");
 
   input = makeRowVector({makeRowVector(
       {makeNullConstant(TypeKind::BIGINT, 10),
        makeNullConstant(TypeKind::DOUBLE, 10)})});
   createDuckDbTable({input});
   plan = PlanBuilder().values({input}).planNode();
-  assertQuery(plan, "SELECT * FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT * FROM tmp");
 }
 
 TEST_F(QueryAssertionsTest, varbinary) {
@@ -467,7 +557,7 @@ TEST_F(QueryAssertionsTest, varbinary) {
   ASSERT_TRUE(assertEqualResults(duckResult, rowType, {data}));
 
   auto plan = PlanBuilder().values({data}).planNode();
-  assertQuery(plan, "SELECT * FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT * FROM tmp");
 }
 
 TEST_F(QueryAssertionsTest, intervalDayTime) {
@@ -479,7 +569,7 @@ TEST_F(QueryAssertionsTest, intervalDayTime) {
 
   createDuckDbTable({data});
   auto plan = PlanBuilder().values({data}).planNode();
-  assertQuery(plan, "SELECT * FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT * FROM tmp");
 
   data = makeRowVector({makeMapVectorFromJson<int64_t, double>(
       {"null",
@@ -491,7 +581,7 @@ TEST_F(QueryAssertionsTest, intervalDayTime) {
       MAP(INTERVAL_DAY_TIME(), DOUBLE()))});
   createDuckDbTable({data});
   plan = PlanBuilder().values({data}).planNode();
-  assertQuery(plan, "SELECT * FROM tmp");
+  assertQueryWithThreadingConfigs(plan, "SELECT * FROM tmp");
 }
 
 TEST_F(QueryAssertionsTest, plansWithEqualResults) {

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-add_library(
+velox_add_library(
   velox_exec
   AddressableNonNullValueList.cpp
   Aggregate.cpp
@@ -22,6 +22,7 @@ add_library(
   AggregationMasks.cpp
   AggregateWindow.cpp
   ArrowStream.cpp
+  AssignUniqueId.cpp
   ContainerRowSerde.cpp
   DistinctAggregations.cpp
   Driver.cpp
@@ -54,23 +55,24 @@ add_library(
   Operator.cpp
   OperatorUtils.cpp
   OrderBy.cpp
-  PartitionedOutput.cpp
   OutputBuffer.cpp
   OutputBufferManager.cpp
+  PartitionedOutput.cpp
+  PartitionFunction.cpp
+  PartitionStreamingWindowBuild.cpp
   PlanNodeStats.cpp
+  PrefixSort.cpp
   ProbeOperatorState.cpp
+  RowsStreamingWindowBuild.cpp
   RowContainer.cpp
   RowNumber.cpp
-  SharedArbitrator.cpp
   SortBuffer.cpp
   SortedAggregations.cpp
   SortWindowBuild.cpp
   Spill.cpp
   SpillFile.cpp
-  SpillOperatorGroup.cpp
   Spiller.cpp
   StreamingAggregation.cpp
-  StreamingWindowBuild.cpp
   Strings.cpp
   TableScan.cpp
   TableWriteMerge.cpp
@@ -84,22 +86,21 @@ add_library(
   Window.cpp
   WindowBuild.cpp
   WindowFunction.cpp
-  WindowPartition.cpp
-  AssignUniqueId.cpp
-  PartitionFunction.cpp)
+  WindowPartition.cpp)
 
-target_link_libraries(
+velox_link_libraries(
   velox_exec
   velox_file
   velox_core
   velox_vector
   velox_connector
+  velox_expression
   velox_time
-  velox_codegen
   velox_common_base
   velox_test_util
   velox_arrow_bridge
-  velox_common_compression)
+  velox_common_compression
+  velox_query_trace_exec)
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(fuzzer)
@@ -113,3 +114,4 @@ if(${VELOX_ENABLE_BENCHMARKS})
 endif()
 
 add_subdirectory(prefixsort)
+add_subdirectory(trace)

@@ -43,7 +43,8 @@ class UnsafeRowSerializerTest : public ::testing::Test,
 
     auto arena = std::make_unique<StreamArena>(pool_.get());
     auto rowType = std::dynamic_pointer_cast<const RowType>(rowVector->type());
-    auto serializer = serde_->createSerializer(rowType, numRows, arena.get());
+    auto serializer =
+        serde_->createIterativeSerializer(rowType, numRows, arena.get());
 
     Scratch scratch;
     serializer->append(rowVector, folly::Range(rows.data(), numRows), scratch);
@@ -53,7 +54,8 @@ class UnsafeRowSerializerTest : public ::testing::Test,
     ASSERT_EQ(size, output->tellp());
   }
 
-  ByteInputStream toByteStream(const std::vector<std::string_view>& inputs) {
+  std::unique_ptr<ByteInputStream> toByteStream(
+      const std::vector<std::string_view>& inputs) {
     std::vector<ByteRange> ranges;
     ranges.reserve(inputs.size());
 
@@ -63,7 +65,7 @@ class UnsafeRowSerializerTest : public ::testing::Test,
            (int32_t)input.length(),
            0});
     }
-    return ByteInputStream(std::move(ranges));
+    return std::make_unique<BufferInputStream>(std::move(ranges));
   }
 
   RowVectorPtr deserialize(
@@ -72,7 +74,7 @@ class UnsafeRowSerializerTest : public ::testing::Test,
     auto byteStream = toByteStream(input);
 
     RowVectorPtr result;
-    serde_->deserialize(&byteStream, pool_.get(), rowType, &result);
+    serde_->deserialize(byteStream.get(), pool_.get(), rowType, &result);
     return result;
   }
 
@@ -283,7 +285,7 @@ TEST_F(UnsafeRowSerializerTest, incompleteRow) {
   buffers = {{rawData, 2}};
   VELOX_ASSERT_RUNTIME_THROW(
       testDeserialize(buffers, expected),
-      "Reading past end of ByteInputStream");
+      "(1 vs. 1) Reading past end of BufferInputStream");
 }
 
 TEST_F(UnsafeRowSerializerTest, types) {

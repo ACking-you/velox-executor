@@ -205,7 +205,9 @@ class IntegerColumnWriter : public BaseColumnWriter {
                 context.shareFlatMapDictionaries() ? 0 : sequence},
             getMemoryPool(MemoryUsageCategory::DICTIONARY),
             getMemoryPool(MemoryUsageCategory::GENERAL))},
-        rows_{getMemoryPool(MemoryUsageCategory::GENERAL)},
+        rows_{
+            getMemoryPool(MemoryUsageCategory::GENERAL),
+            /*initialCapacity=*/16},
         dictionaryKeySizeThreshold_{
             getConfig(Config::DICTIONARY_NUMERIC_KEY_SIZE_THRESHOLD)},
         sort_{getConfig(Config::DICTIONARY_SORT_KEYS)},
@@ -443,6 +445,11 @@ class IntegerColumnWriter : public BaseColumnWriter {
     if (endOfLastStride < rows_.size()) {
       populateData(endOfLastStride, rows_.size());
     }
+  }
+
+  bool useDictionaryEncoding() const override {
+    return getConfig(Config::INTEGER_DICTIONARY_ENCODING_ENABLED) &&
+        BaseColumnWriter::useDictionaryEncoding();
   }
 
   void populateDictionaryEncodingStreams();
@@ -795,7 +802,9 @@ class StringColumnWriter : public BaseColumnWriter {
         dictEncoder_{
             getMemoryPool(MemoryUsageCategory::DICTIONARY),
             getMemoryPool(MemoryUsageCategory::GENERAL)},
-        rows_{getMemoryPool(MemoryUsageCategory::GENERAL)},
+        rows_{
+            getMemoryPool(MemoryUsageCategory::GENERAL),
+            /*initialCapacity=*/16},
         encodingSelector_{
             getMemoryPool(MemoryUsageCategory::GENERAL),
             getConfig(Config::DICTIONARY_STRING_KEY_SIZE_THRESHOLD),
@@ -951,14 +960,6 @@ class StringColumnWriter : public BaseColumnWriter {
     return true;
   }
 
- protected:
-  bool useDictionaryEncoding() const override {
-    return (sequence_ == 0 ||
-            !context_.getConfig(
-                Config::MAP_FLAT_DISABLE_DICT_ENCODING_STRING)) &&
-        !context_.isLowMemoryMode();
-  }
-
  private:
   uint64_t writeDict(
       DecodedVector& decodedVector,
@@ -1052,6 +1053,13 @@ class StringColumnWriter : public BaseColumnWriter {
     if (endOfLastStride < rows_.size()) {
       populateData(endOfLastStride, rows_.size(), numStrides);
     }
+  }
+
+  bool useDictionaryEncoding() const override {
+    return getConfig(Config::STRING_DICTIONARY_ENCODING_ENABLED) &&
+        (sequence_ == 0 ||
+         !getConfig(Config::MAP_FLAT_DISABLE_DICT_ENCODING_STRING)) &&
+        !context_.isLowMemoryMode();
   }
 
   void populateDictionaryEncodingStreams();

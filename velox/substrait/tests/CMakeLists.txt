@@ -14,14 +14,14 @@
 
 add_executable(
   velox_plan_conversion_test
-  Substrait2VeloxPlanConversionTest.cpp
-  Substrait2VeloxValuesNodeConversionTest.cpp
   FunctionTest.cpp
   JsonToProtoConverter.cpp
+  Substrait2VeloxPlanConversionTest.cpp
+  Substrait2VeloxValuesNodeConversionTest.cpp
+  SubstraitExtensionCollectorTest.cpp
   VeloxSubstraitRoundTripTest.cpp
   VeloxToSubstraitTypeTest.cpp
-  VeloxSubstraitSignatureTest.cpp
-  SubstraitExtensionCollectorTest.cpp)
+  VeloxSubstraitSignatureTest.cpp)
 
 add_dependencies(velox_plan_conversion_test velox_substrait_plan_converter)
 
@@ -56,8 +56,8 @@ target_link_libraries(
   Boost::regex
   Boost::thread
   Boost::system
-  gtest
-  gtest_main
+  GTest::gtest
+  GTest::gtest_main
   Folly::folly
   gflags::gflags
   glog::glog

@@ -32,13 +32,15 @@ class ParquetParams;
 class StructColumnReader : public dwio::common::SelectiveStructColumnReader {
  public:
   StructColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       ParquetParams& params,
       common::ScanSpec& scanSpec);
 
-  void read(vector_size_t offset, RowSet rows, const uint64_t* incomingNulls)
-      override;
+  void read(
+      vector_size_t offset,
+      const RowSet& rows,
+      const uint64_t* incomingNulls) override;
 
   void seekToRowGroup(uint32_t index) override;
 
@@ -52,12 +54,12 @@ class StructColumnReader : public dwio::common::SelectiveStructColumnReader {
   // No-op in Parquet. All readers switch row groups at the same time, there is
   // no on-demand skipping to a new row group.
   void advanceFieldReader(
-      dwio::common::SelectiveColumnReader* FOLLY_NONNULL /*reader*/,
+      dwio::common::SelectiveColumnReader* /*reader*/,
       vector_size_t /*offset*/) override {}
 
   void setNullsFromRepDefs(PageReader& pageReader);
 
-  dwio::common::SelectiveColumnReader* FOLLY_NULLABLE childForRepDefs() const {
+  dwio::common::SelectiveColumnReader* childForRepDefs() const {
     return childForRepDefs_;
   }
 
@@ -84,7 +86,7 @@ class StructColumnReader : public dwio::common::SelectiveStructColumnReader {
 
   // Leaf column reader used for getting nullability information for
   // 'this'. This is nullptr for the root of a table.
-  dwio::common::SelectiveColumnReader* FOLLY_NULLABLE childForRepDefs_{nullptr};
+  dwio::common::SelectiveColumnReader* childForRepDefs_{nullptr};
 
   // Mode for getting nulls from repdefs. kStructOverLists if 'this'
   // only has list children.

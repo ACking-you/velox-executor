@@ -18,11 +18,13 @@
 #include <folly/Executor.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/tests/utils/VectorMaker.h"
 
 #include <gtest/gtest.h>
 #include <optional>
+#include "velox/type/CppToType.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 namespace facebook::velox::test {
@@ -127,6 +129,13 @@ class VectorTestBase {
       const std::shared_ptr<const RowType>& rowType,
       vector_size_t size) {
     return vectorMaker_.rowVector(rowType, size);
+  }
+
+  RowVectorPtr makeRowVector(
+      const RowTypePtr& type,
+      const VectorFuzzer::Options& fuzzerOpts) {
+    VectorFuzzer fuzzer(fuzzerOpts, pool());
+    return fuzzer.fuzzRow(type);
   }
 
   std::vector<RowVectorPtr> createVectors(
@@ -300,7 +309,7 @@ class VectorTestBase {
       if (!vector.has_value()) {
         bits::setNull(rawNulls, i, true);
         rawSizes[i] = 0;
-        rawOffsets[i] = 0;
+        rawOffsets[i] = (i == 0) ? 0 : rawOffsets[i - 1] + rawSizes[i - 1];
       } else {
         flattenedData.insert(
             flattenedData.end(), vector->begin(), vector->end());
@@ -804,6 +813,24 @@ class VectorTestBase {
   std::shared_ptr<folly::Executor> executor_{
       std::make_shared<folly::CPUThreadPoolExecutor>(
           std::thread::hardware_concurrency())};
+  std::shared_ptr<folly::Executor> spillExecutor_{
+      std::make_shared<folly::CPUThreadPoolExecutor>(
+          std::thread::hardware_concurrency())};
+};
+
+class TestRuntimeStatWriter : public BaseRuntimeStatWriter {
+ public:
+  void addRuntimeStat(const std::string& name, const RuntimeCounter& value)
+      override {
+    stats_.emplace_back(name, value);
+  }
+
+  const std::vector<std::pair<std::string, RuntimeCounter>>& stats() const {
+    return stats_;
+  }
+
+ private:
+  std::vector<std::pair<std::string, RuntimeCounter>> stats_;
 };
 
 } // namespace facebook::velox::test

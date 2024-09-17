@@ -17,6 +17,7 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 #include <vector>
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/dwio/common/exception/Exception.h"
 #include "velox/dwio/dwrf/common/ByteRLE.h"
 #include "velox/dwio/dwrf/test/OrcTest.h"
@@ -911,7 +912,7 @@ TEST(ByteRle, testSeek) {
   PositionProvider pp{position};
   rle->seekToRowGroup(pp);
   // Seek is fine, but read should fail
-  EXPECT_THROW(rle->next(data.data(), 1, nullptr), exception::LoggedException);
+  VELOX_ASSERT_THROW(rle->next(data.data(), 1, nullptr), "");
 
   // Seek to end + 1
   position.clear();
@@ -919,7 +920,7 @@ TEST(ByteRle, testSeek) {
   position.push_back(1);
   PositionProvider pp2{position};
   rle->seekToRowGroup(pp2);
-  EXPECT_THROW(rle->next(data.data(), 1, nullptr), exception::LoggedException);
+  VELOX_ASSERT_THROW(rle->next(data.data(), 1, nullptr), "");
 }
 
 TEST(BooleanRle, simpleTest) {
@@ -1201,15 +1202,12 @@ TEST(BooleanRle, skipTestWithNulls) {
   std::unique_ptr<SeekableInputStream> stream(
       new SeekableArrayInputStream(buffer, VELOX_ARRAY_SIZE(buffer)));
   std::unique_ptr<ByteRleDecoder> rle = createBooleanDecoder(std::move(stream));
-  std::vector<char> data;
-  // Buffers are expected to be writable in full words. Init a full
-  // word for valgrind, then resize to actually used size.
-  data.resize(bits::roundUp(3, 8));
+  raw_vector<char> data;
   data.resize(3);
   std::vector<uint64_t> someNull(1, ~0x0505050505050505);
   std::vector<uint64_t> allNull(1, bits::kNull64);
   for (size_t i = 0; i < 16384; i += 5) {
-    data.assign(data.size(), -1);
+    std::fill(data.begin(), data.end(), -1);
     rle->next(data.data(), data.size(), someNull.data());
     EXPECT_EQ(0, bits::isBitSet(data.data(), 0)) << "Output wrong at " << i;
     EXPECT_EQ(0, bits::isBitSet(data.data(), 2)) << "Output wrong at " << i;
@@ -1219,7 +1217,7 @@ TEST(BooleanRle, skipTestWithNulls) {
       rle->skip(4);
     }
     rle->skip(0);
-    data.assign(data.size(), -1);
+    std::fill(data.begin(), data.end(), -1);
     ;
     rle->next(data.data(), data.size(), allNull.data());
     for (size_t j = 0; j < data.size(); ++j) {
@@ -1604,7 +1602,7 @@ TEST(BooleanRle, skipToEnd) {
   rle->next(value, 1, nullptr);
   rle->skip(15);
   // additional read will fail
-  ASSERT_THROW(rle->next(value, 1, nullptr), exception::LoggedException);
+  VELOX_ASSERT_THROW(rle->next(value, 1, nullptr), "");
 }
 
 TEST(BooleanRle, longReadTest) {

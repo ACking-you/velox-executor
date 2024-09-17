@@ -15,20 +15,19 @@
  */
 #pragma once
 
+#include <fmt/format.h>
+
 #include "velox/connectors/Connector.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/QueryConfig.h"
 
-#include "velox/vector/arrow/Abi.h"
-#include "velox/vector/arrow/Bridge.h"
+struct ArrowArrayStream;
 
 namespace facebook::velox::core {
 
 typedef std::string PlanNodeId;
 
-/**
- * Generic representation of InsertTable
- */
+/// Generic representation of InsertTable
 struct InsertTableHandle {
  public:
   InsertTableHandle(
@@ -157,17 +156,17 @@ class PlanNode : public ISerializable {
   /// 'addContext' is not null.
   ///
   /// @param addContext Optional lambda to add context for a given plan node.
-  /// Receives plan node ID, indentation and std::stringstring where to append
+  /// Receives plan node ID, indentation and std::stringstream where to append
   /// the context. Use indentation for second and subsequent lines of a
-  /// mult-line context. Do not use indentation for single-line context. Do not
+  /// multi-line context. Do not use indentation for single-line context. Do not
   /// add trailing new-line character for the last or only line of context.
   std::string toString(
       bool detailed = false,
       bool recursive = false,
-      std::function<void(
+      const std::function<void(
           const PlanNodeId& planNodeId,
           const std::string& indentation,
-          std::stringstream& stream)> addContext = nullptr) const {
+          std::stringstream& stream)>& addContext = nullptr) const {
     std::stringstream stream;
     toString(stream, detailed, recursive, 0, addContext);
     return stream.str();
@@ -210,10 +209,10 @@ class PlanNode : public ISerializable {
       bool detailed,
       bool recursive,
       size_t indentationSize,
-      std::function<void(
+      const std::function<void(
           const PlanNodeId& planNodeId,
           const std::string& indentation,
-          std::stringstream& stream)> addContext) const;
+          std::stringstream& stream)>& addContext) const;
 
   const std::string id_;
 };
@@ -911,7 +910,7 @@ class GroupIdNode : public PlanNode {
     return aggregationInputs_;
   }
 
-  const std::string& groupIdName() {
+  const std::string& groupIdName() const {
     return groupIdName_;
   }
 
@@ -1357,16 +1356,16 @@ FOLLY_ALWAYS_INLINE std::ostream& operator<<(
 enum class JoinType {
   // For each row on the left, find all matching rows on the right and return
   // all combinations.
-  kInner,
+  kInner = 0,
   // For each row on the left, find all matching rows on the right and return
   // all combinations. In addition, return all rows from the left that have no
   // match on the right with right-side columns filled with nulls.
-  kLeft,
+  kLeft = 1,
   // Opposite of kLeft. For each row on the right, find all matching rows on the
   // left and return all combinations. In addition, return all rows from the
   // right that have no match on the left with left-side columns filled with
   // nulls.
-  kRight,
+  kRight = 2,
   // A "union" of kLeft and kRight. For each row on the left, find all matching
   // rows on the right and return all combinations. In addition, return all rows
   // from the left that have no
@@ -1374,11 +1373,11 @@ enum class JoinType {
   // all rows from the
   // right that have no match on the left with left-side columns filled with
   // nulls.
-  kFull,
+  kFull = 3,
   // Return a subset of rows from the left side which have a match on the right
   // side. For this join type, cardinality of the output is less than or equal
   // to the cardinality of the left side.
-  kLeftSemiFilter,
+  kLeftSemiFilter = 4,
   // Return each row from the left side with a boolean flag indicating whether
   // there exists a match on the right side. For this join type, cardinality of
   // the output equals the cardinality of the left side.
@@ -1387,11 +1386,11 @@ enum class JoinType {
   // 'nullAware' boolean specified separately.
   //
   // Null-aware join follows IN semantic. Regular join follows EXISTS semantic.
-  kLeftSemiProject,
+  kLeftSemiProject = 5,
   // Opposite of kLeftSemiFilter. Return a subset of rows from the right side
   // which have a match on the left side. For this join type, cardinality of the
   // output is less than or equal to the cardinality of the right side.
-  kRightSemiFilter,
+  kRightSemiFilter = 6,
   // Opposite of kLeftSemiProject. Return each row from the right side with a
   // boolean flag indicating whether there exists a match on the left side. For
   // this join type, cardinality of the output equals the cardinality of the
@@ -1401,7 +1400,7 @@ enum class JoinType {
   // 'nullAware' boolean specified separately.
   //
   // Null-aware join follows IN semantic. Regular join follows EXISTS semantic.
-  kRightSemiProject,
+  kRightSemiProject = 7,
   // Return each row from the left side which has no match on the right side.
   // The handling of the rows with nulls in the join key depends on the
   // 'nullAware' boolean specified separately.
@@ -1415,7 +1414,8 @@ enum class JoinType {
   // Regular anti join follows NOT EXISTS semantic:
   // (1) ignore right-side rows with nulls in the join keys;
   // (2) unconditionally return left side rows with nulls in the join keys.
-  kAnti,
+  kAnti = 8,
+  kNumJoinTypes = 9,
 };
 
 const char* joinTypeName(JoinType joinType);
@@ -1526,6 +1526,10 @@ class AbstractJoinNode : public PlanNode {
     return joinType_ == JoinType::kAnti;
   }
 
+  bool isPreservingProbeOrder() const {
+    return isInnerJoin() || isLeftJoin() || isAntiJoin();
+  }
+
   const std::vector<FieldAccessTypedExprPtr>& leftKeys() const {
     return leftKeys_;
   }
@@ -1587,7 +1591,7 @@ class HashJoinNode : public AbstractJoinNode {
     if (nullAware) {
       VELOX_USER_CHECK(
           isNullAwareSupported(joinType),
-          "Null-aware flag is supported only for semi and anti joins");
+          "Null-aware flag is supported only for semi project and anti joins");
       VELOX_USER_CHECK_EQ(
           1, leftKeys_.size(), "Null-aware joins allow only one join key");
 
@@ -1641,22 +1645,16 @@ class MergeJoinNode : public AbstractJoinNode {
       TypedExprPtr filter,
       PlanNodePtr left,
       PlanNodePtr right,
-      RowTypePtr outputType)
-      : AbstractJoinNode(
-            id,
-            joinType,
-            leftKeys,
-            rightKeys,
-            std::move(filter),
-            std::move(left),
-            std::move(right),
-            std::move(outputType)) {}
+      RowTypePtr outputType);
 
   std::string_view name() const override {
     return "MergeJoin";
   }
 
   folly::dynamic serialize() const override;
+
+  /// If merge join supports this join type.
+  static bool isSupported(core::JoinType joinType);
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
 };
@@ -1665,9 +1663,10 @@ class MergeJoinNode : public AbstractJoinNode {
 /// exec::NestedLoopJoinProbe and exec::NestedLoopJoinBuild. A separate pipeline
 /// is produced for the build side when generating exec::Operators.
 ///
-/// Nested loop join supports both equal and non-equal joins. Expressions
+/// Nested loop join (NLJ) supports both equal and non-equal joins. Expressions
 /// specified in joinCondition are evaluated on every combination of left/right
-/// tuple, to emit result.
+/// tuple, to emit result. Results are emitted following the same input order of
+/// probe rows for inner and left joins, for each thread of execution.
 ///
 /// To create Cartesian product of the left/right's output, use the constructor
 /// without `joinType` and `joinCondition` parameter.
@@ -1709,6 +1708,9 @@ class NestedLoopJoinNode : public PlanNode {
 
   folly::dynamic serialize() const override;
 
+  /// If nested loop join supports this join type.
+  static bool isSupported(core::JoinType joinType);
+
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
 
  private:
@@ -1739,6 +1741,15 @@ class OrderByNode : public PlanNode {
         sortingKeys.size(),
         sortingOrders.size(),
         "Number of sorting keys and sorting orders in OrderBy must be the same");
+    // Reject duplicate sorting keys.
+    std::unordered_set<std::string> uniqueKeys;
+    for (const auto& sortKey : sortingKeys) {
+      VELOX_USER_CHECK_NOT_NULL(sortKey, "Sorting key cannot be null");
+      VELOX_USER_CHECK(
+          uniqueKeys.insert(sortKey->name()).second,
+          "Duplicate sorting keys are not allowed: {}",
+          sortKey->name());
+    }
   }
 
   const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
@@ -2083,7 +2094,6 @@ class WindowNode : public PlanNode {
   /// Frame bounds can be CURRENT ROW, UNBOUNDED PRECEDING(FOLLOWING)
   /// and k PRECEDING(FOLLOWING). K could be a constant or column.
   ///
-  /// k PRECEDING(FOLLOWING) is only supported for ROW frames now.
   /// k has to be of integer or bigint type.
   struct Frame {
     WindowType type;
@@ -2386,3 +2396,21 @@ class TopNRowNumberNode : public PlanNode {
 };
 
 } // namespace facebook::velox::core
+
+template <>
+struct fmt::formatter<facebook::velox::core::PartitionedOutputNode::Kind>
+    : formatter<std::string> {
+  auto format(
+      facebook::velox::core::PartitionedOutputNode::Kind s,
+      format_context& ctx) {
+    return formatter<std::string>::format(
+        facebook::velox::core::PartitionedOutputNode::kindString(s), ctx);
+  }
+};
+
+template <>
+struct fmt::formatter<facebook::velox::core::JoinType> : formatter<int> {
+  auto format(facebook::velox::core::JoinType s, format_context& ctx) {
+    return formatter<int>::format(static_cast<int>(s), ctx);
+  }
+};

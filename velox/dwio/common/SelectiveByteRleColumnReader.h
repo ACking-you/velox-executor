@@ -37,16 +37,20 @@ class SelectiveByteRleColumnReader : public SelectiveColumnReader {
     return false;
   }
 
-  void getValues(RowSet rows, VectorPtr* result) override;
+  void getValues(const RowSet& rows, VectorPtr* result) override;
 
-  template <typename Reader, bool isDense, typename ExtractValues>
+  template <
+      typename Reader,
+      bool isDense,
+      bool kEncodingHasNulls,
+      typename ExtractValues>
   void processFilter(
       velox::common::Filter* filter,
       ExtractValues extractValues,
-      RowSet rows);
+      const RowSet& rows);
 
   template <typename Reader, bool isDense>
-  void processValueHook(RowSet rows, ValueHook* hook);
+  void processValueHook(const RowSet& rows, ValueHook* hook);
 
   template <
       typename Reader,
@@ -55,12 +59,14 @@ class SelectiveByteRleColumnReader : public SelectiveColumnReader {
       typename ExtractValues>
   void readHelper(
       velox::common::Filter* filter,
-      RowSet rows,
+      const RowSet& rows,
       ExtractValues extractValues);
 
-  template <typename Reader>
-  void
-  readCommon(vector_size_t offset, RowSet rows, const uint64_t* incomingNulls);
+  template <typename Reader, bool kEncodingHasNulls>
+  void readCommon(
+      vector_size_t offset,
+      const RowSet& rows,
+      const uint64_t* incomingNulls);
 };
 
 template <
@@ -70,7 +76,7 @@ template <
     typename ExtractValues>
 void SelectiveByteRleColumnReader::readHelper(
     velox::common::Filter* filter,
-    RowSet rows,
+    const RowSet& rows,
     ExtractValues extractValues) {
   reinterpret_cast<Reader*>(this)->readWithVisitor(
       rows,
@@ -78,11 +84,15 @@ void SelectiveByteRleColumnReader::readHelper(
           *reinterpret_cast<TFilter*>(filter), this, rows, extractValues));
 }
 
-template <typename Reader, bool isDense, typename ExtractValues>
+template <
+    typename Reader,
+    bool isDense,
+    bool kEncodingHasNulls,
+    typename ExtractValues>
 void SelectiveByteRleColumnReader::processFilter(
     velox::common::Filter* filter,
     ExtractValues extractValues,
-    RowSet rows) {
+    const RowSet& rows) {
   using velox::common::FilterKind;
   switch (filter ? filter->kind() : FilterKind::kAlwaysTrue) {
     case FilterKind::kAlwaysTrue:
@@ -90,13 +100,20 @@ void SelectiveByteRleColumnReader::processFilter(
           filter, rows, extractValues);
       break;
     case FilterKind::kIsNull:
-      filterNulls<int8_t>(
-          rows,
-          true,
-          !std::is_same_v<decltype(extractValues), dwio::common::DropValues>);
+      if constexpr (kEncodingHasNulls) {
+        filterNulls<int8_t>(
+            rows,
+            true,
+            !std::is_same_v<decltype(extractValues), dwio::common::DropValues>);
+      } else {
+        readHelper<Reader, velox::common::IsNull, isDense>(
+            filter, rows, extractValues);
+      }
       break;
     case FilterKind::kIsNotNull:
-      if (std::is_same_v<decltype(extractValues), dwio::common::DropValues>) {
+      if constexpr (
+          kEncodingHasNulls &&
+          std::is_same_v<decltype(extractValues), dwio::common::DropValues>) {
         filterNulls<int8_t>(rows, false, false);
       } else {
         readHelper<Reader, velox::common::IsNotNull, isDense>(
@@ -130,31 +147,27 @@ void SelectiveByteRleColumnReader::processFilter(
 
 template <typename Reader, bool isDense>
 void SelectiveByteRleColumnReader::processValueHook(
-    RowSet rows,
+    const RowSet& rows,
     ValueHook* hook) {
   using namespace facebook::velox::aggregate;
   switch (hook->kind()) {
-    case aggregate::AggregationHook::kSumBigintToBigint:
+    case aggregate::AggregationHook::kBigintSum:
       readHelper<Reader, velox::common::AlwaysTrue, isDense>(
-          &dwio::common::alwaysTrue(),
-          rows,
-          dwio::common::ExtractToHook<SumHook<int64_t, int64_t>>(hook));
+          &alwaysTrue(), rows, ExtractToHook<SumHook<int64_t>>(hook));
       break;
     default:
       readHelper<Reader, velox::common::AlwaysTrue, isDense>(
-          &dwio::common::alwaysTrue(),
-          rows,
-          dwio::common::ExtractToGenericHook(hook));
+          &alwaysTrue(), rows, ExtractToGenericHook(hook));
   }
 }
 
-template <typename Reader>
+template <typename Reader, bool kEncodingHasNulls>
 void SelectiveByteRleColumnReader::readCommon(
     vector_size_t offset,
-    RowSet rows,
+    const RowSet& rows,
     const uint64_t* incomingNulls) {
   prepareRead<int8_t>(offset, rows, incomingNulls);
-  bool isDense = rows.back() == rows.size() - 1;
+  const bool isDense = rows.back() == rows.size() - 1;
   velox::common::Filter* filter =
       scanSpec_->filter() ? scanSpec_->filter() : &dwio::common::alwaysTrue();
   if (scanSpec_->keepValues()) {
@@ -167,17 +180,19 @@ void SelectiveByteRleColumnReader::readCommon(
       return;
     }
     if (isDense) {
-      processFilter<Reader, true>(
+      processFilter<Reader, true, kEncodingHasNulls>(
           filter, dwio::common::ExtractToReader(this), rows);
     } else {
-      processFilter<Reader, false>(
+      processFilter<Reader, false, kEncodingHasNulls>(
           filter, dwio::common::ExtractToReader(this), rows);
     }
   } else {
     if (isDense) {
-      processFilter<Reader, true>(filter, dwio::common::DropValues(), rows);
+      processFilter<Reader, true, kEncodingHasNulls>(
+          filter, dwio::common::DropValues(), rows);
     } else {
-      processFilter<Reader, false>(filter, dwio::common::DropValues(), rows);
+      processFilter<Reader, false, kEncodingHasNulls>(
+          filter, dwio::common::DropValues(), rows);
     }
   }
 }

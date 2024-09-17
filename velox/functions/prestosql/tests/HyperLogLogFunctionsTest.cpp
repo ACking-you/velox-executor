@@ -57,8 +57,8 @@ TEST_F(HyperLogLogFunctionsTest, cardinalitySignatures) {
   auto signatures = getSignatureStrings("cardinality");
   ASSERT_EQ(3, signatures.size());
 
-  ASSERT_EQ(1, signatures.count("(map(any,any)) -> bigint"));
-  ASSERT_EQ(1, signatures.count("(array(any)) -> bigint"));
+  ASSERT_EQ(1, signatures.count("(map(__user_T1,__user_T2)) -> bigint"));
+  ASSERT_EQ(1, signatures.count("(array(__user_T1)) -> bigint"));
   ASSERT_EQ(1, signatures.count("(hyperloglog) -> bigint"));
 }
 
@@ -66,14 +66,13 @@ TEST_F(HyperLogLogFunctionsTest, emptyApproxSetSignatures) {
   auto signatures = getSignatureStrings("empty_approx_set");
   ASSERT_EQ(2, signatures.size());
 
-  ASSERT_EQ(1, signatures.count("(double) -> hyperloglog"));
+  ASSERT_EQ(1, signatures.count("(constant double) -> hyperloglog"));
   ASSERT_EQ(1, signatures.count("() -> hyperloglog"));
 }
 
 TEST_F(HyperLogLogFunctionsTest, cardinalitySparse) {
-  const auto cardinality = [&](const std::string& input) {
-    return evaluateOnce<int64_t, StringView>(
-        "cardinality(c0)", {StringView(input)}, {HYPERLOGLOG()});
+  const auto cardinality = [&](const std::optional<std::string>& input) {
+    return evaluateOnce<int64_t>("cardinality(c0)", HYPERLOGLOG(), input);
   };
 
   SparseHll sparseHll{&allocator_};
@@ -86,9 +85,8 @@ TEST_F(HyperLogLogFunctionsTest, cardinalitySparse) {
 }
 
 TEST_F(HyperLogLogFunctionsTest, cardinalityDense) {
-  const auto cardinality = [&](const std::string& input) {
-    return evaluateOnce<int64_t, StringView>(
-        "cardinality(c0)", {StringView(input)}, {HYPERLOGLOG()});
+  const auto cardinality = [&](const std::optional<std::string>& input) {
+    return evaluateOnce<int64_t>("cardinality(c0)", HYPERLOGLOG(), input);
   };
 
   DenseHll denseHll{12, &allocator_};

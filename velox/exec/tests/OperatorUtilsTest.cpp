@@ -23,10 +23,17 @@
 using namespace facebook::velox;
 using namespace facebook::velox::test;
 using namespace facebook::velox::exec;
+using namespace facebook::velox::exec::test;
 
-class OperatorUtilsTest
-    : public ::facebook::velox::exec::test::OperatorTestBase {
+class OperatorUtilsTest : public OperatorTestBase {
  protected:
+  void TearDown() override {
+    driverCtx_.reset();
+    driver_.reset();
+    task_.reset();
+    OperatorTestBase::TearDown();
+  }
+
   OperatorUtilsTest() {
     VectorMaker vectorMaker{pool_.get()};
     std::vector<RowVectorPtr> values = {vectorMaker.rowVector(
@@ -34,12 +41,14 @@ class OperatorUtilsTest
     core::PlanFragment planFragment;
     const core::PlanNodeId id{"0"};
     planFragment.planNode = std::make_shared<core::ValuesNode>(id, values);
+    executor_ = std::make_shared<folly::CPUThreadPoolExecutor>(4);
 
     task_ = Task::create(
         "SpillOperatorGroupTest_task",
         std::move(planFragment),
         0,
-        std::make_shared<core::QueryCtx>());
+        core::QueryCtx::create(executor_.get()),
+        Task::ExecutionMode::kParallel);
     driver_ = Driver::testingCreate();
     driverCtx_ = std::make_unique<DriverCtx>(task_, 0, 0, 0, 0);
     driverCtx_->driver = driver_.get();
@@ -124,8 +133,57 @@ class OperatorUtilsTest
     }
   }
 
-  std::shared_ptr<memory::MemoryPool> pool_{
-      memory::memoryManager()->addLeafPool()};
+  void setTaskOutputBatchConfig(
+      uint32_t preferredBatchSize,
+      uint32_t maxRows,
+      uint64_t preferredBytes) {
+    std::unordered_map<std::string, std::string> configs;
+    configs[core::QueryConfig::kPreferredOutputBatchRows] =
+        std::to_string(preferredBatchSize);
+    configs[core::QueryConfig::kMaxOutputBatchRows] = std::to_string(maxRows);
+    configs[core::QueryConfig::kPreferredOutputBatchBytes] =
+        std::to_string(preferredBytes);
+    task_->queryCtx()->testingOverrideConfigUnsafe(std::move(configs));
+  }
+
+  class MockOperator : public Operator {
+   public:
+    MockOperator(
+        DriverCtx* driverCtx,
+        RowTypePtr rowType,
+        std::string operatorType = "MockType")
+        : Operator(
+              driverCtx,
+              std::move(rowType),
+              0,
+              "MockOperator",
+              operatorType) {}
+
+    bool needsInput() const override {
+      return false;
+    }
+
+    void addInput(RowVectorPtr input) override {}
+
+    RowVectorPtr getOutput() override {
+      return nullptr;
+    }
+
+    BlockingReason isBlocked(ContinueFuture* future) override {
+      return BlockingReason::kNotBlocked;
+    }
+
+    bool isFinished() override {
+      return false;
+    }
+
+    vector_size_t outputRows(
+        std::optional<uint64_t> averageRowSize = std::nullopt) const {
+      return outputBatchRows(averageRowSize);
+    }
+  };
+
+  std::shared_ptr<folly::CPUThreadPoolExecutor> executor_;
   std::shared_ptr<Task> task_;
   std::shared_ptr<Driver> driver_;
   std::unique_ptr<DriverCtx> driverCtx_;
@@ -384,35 +442,6 @@ TEST_F(OperatorUtilsTest, projectChildren) {
 }
 
 TEST_F(OperatorUtilsTest, reclaimableSectionGuard) {
-  class MockOperator : public Operator {
-   public:
-    MockOperator(DriverCtx* driverCtx, RowTypePtr rowType)
-        : Operator(
-              driverCtx,
-              std::move(rowType),
-              0,
-              "MockOperator",
-              "MockType") {}
-
-    bool needsInput() const override {
-      return false;
-    }
-
-    void addInput(RowVectorPtr input) override {}
-
-    RowVectorPtr getOutput() override {
-      return nullptr;
-    }
-
-    BlockingReason isBlocked(ContinueFuture* future) override {
-      return BlockingReason::kNotBlocked;
-    }
-
-    bool isFinished() override {
-      return false;
-    }
-  };
-
   RowTypePtr rowType = ROW({"c0"}, {INTEGER()});
 
   MockOperator mockOp(driverCtx_.get(), rowType);
@@ -455,4 +484,50 @@ TEST_F(OperatorUtilsTest, memStatsFromPool) {
   ASSERT_EQ(stats.peakUserMemoryReservation, 2L << 20);
   ASSERT_EQ(stats.peakSystemMemoryReservation, 0);
   ASSERT_EQ(stats.numMemoryAllocations, 1);
+}
+
+TEST_F(OperatorUtilsTest, dynamicFilterStats) {
+  DynamicFilterStats dynamicFilterStats;
+  ASSERT_TRUE(dynamicFilterStats.empty());
+  const std::string nodeId1{"node1"};
+  const std::string nodeId2{"node2"};
+  dynamicFilterStats.producerNodeIds.emplace(nodeId1);
+  ASSERT_FALSE(dynamicFilterStats.empty());
+  DynamicFilterStats dynamicFilterStatsToMerge;
+  dynamicFilterStatsToMerge.producerNodeIds.emplace(nodeId1);
+  ASSERT_FALSE(dynamicFilterStatsToMerge.empty());
+  dynamicFilterStats.add(dynamicFilterStatsToMerge);
+  ASSERT_EQ(dynamicFilterStats.producerNodeIds.size(), 1);
+  ASSERT_EQ(
+      dynamicFilterStats.producerNodeIds,
+      std::unordered_set<core::PlanNodeId>({nodeId1}));
+
+  dynamicFilterStatsToMerge.producerNodeIds.emplace(nodeId2);
+  dynamicFilterStats.add(dynamicFilterStatsToMerge);
+  ASSERT_EQ(dynamicFilterStats.producerNodeIds.size(), 2);
+  ASSERT_EQ(
+      dynamicFilterStats.producerNodeIds,
+      std::unordered_set<core::PlanNodeId>({nodeId1, nodeId2}));
+
+  dynamicFilterStats.clear();
+  ASSERT_TRUE(dynamicFilterStats.empty());
+}
+
+TEST_F(OperatorUtilsTest, outputBatchRows) {
+  RowTypePtr rowType = ROW({"c0"}, {INTEGER()});
+  {
+    setTaskOutputBatchConfig(10, 20, 234);
+    MockOperator mockOp(driverCtx_.get(), rowType, "MockType1");
+    ASSERT_EQ(10, mockOp.outputRows(std::nullopt));
+    ASSERT_EQ(20, mockOp.outputRows(1));
+    ASSERT_EQ(20, mockOp.outputRows(0));
+    ASSERT_EQ(1, mockOp.outputRows(UINT64_MAX));
+    ASSERT_EQ(1, mockOp.outputRows(1000));
+    ASSERT_EQ(234 / 40, mockOp.outputRows(40));
+  }
+  {
+    setTaskOutputBatchConfig(10, INT32_MAX, 3'000'000'000'000);
+    MockOperator mockOp(driverCtx_.get(), rowType, "MockType2");
+    ASSERT_EQ(1000, mockOp.outputRows(3'000'000'000));
+  }
 }

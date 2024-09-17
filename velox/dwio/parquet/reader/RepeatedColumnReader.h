@@ -38,7 +38,7 @@ class RepeatedLengths {
     return nextLengthIndex_;
   }
 
-  void readLengths(int32_t* FOLLY_NONNULL lengths, int32_t numLengths) {
+  void readLengths(int32_t* lengths, int32_t numLengths) {
     VELOX_CHECK_LE(
         nextLengthIndex_ + numLengths, lengths_->size() / sizeof(int32_t));
     memcpy(
@@ -56,7 +56,7 @@ class RepeatedLengths {
 class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
  public:
   MapColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       ParquetParams& params,
       common::ScanSpec& scanSpec);
@@ -64,7 +64,7 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
   void prepareRead(
       vector_size_t offset,
       RowSet rows,
-      const uint64_t* FOLLY_NULLABLE incomingNulls) {
+      const uint64_t* incomingNulls) {
     // The prepare is done by the topmost list/map/struct.
   }
 
@@ -74,16 +74,16 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
 
   void read(
       vector_size_t offset,
-      RowSet rows,
-      const uint64_t* FOLLY_NULLABLE /*incomingNulls*/) override;
+      const RowSet& rows,
+      const uint64_t* /*incomingNulls*/) override;
 
   void setLengths(BufferPtr lengths) {
     lengths_.setLengths(lengths);
   }
   void readLengths(
-      int32_t* FOLLY_NONNULL lengths,
+      int32_t* lengths,
       int32_t numLengths,
-      const uint64_t* FOLLY_NULLABLE /*nulls*/) override {
+      const uint64_t* /*nulls*/) override {
     lengths_.readLengths(lengths, numLengths);
   }
 
@@ -112,7 +112,7 @@ class MapColumnReader : public dwio::common::SelectiveMapColumnReader {
 class ListColumnReader : public dwio::common::SelectiveListColumnReader {
  public:
   ListColumnReader(
-      const std::shared_ptr<const dwio::common::TypeWithId>& requestedType,
+      const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       ParquetParams& params,
       common::ScanSpec& scanSpec);
@@ -120,7 +120,7 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
   void prepareRead(
       vector_size_t offset,
       RowSet rows,
-      const uint64_t* FOLLY_NULLABLE incomingNulls) {
+      const uint64_t* incomingNulls) {
     // The prepare is done by the topmost list/struct.
   }
 
@@ -130,16 +130,16 @@ class ListColumnReader : public dwio::common::SelectiveListColumnReader {
 
   void read(
       vector_size_t offset,
-      RowSet rows,
-      const uint64_t* FOLLY_NULLABLE /*incomingNulls*/) override;
+      const RowSet& rows,
+      const uint64_t* /*incomingNulls*/) override;
 
   void setLengths(BufferPtr lengths) {
     lengths_.setLengths(lengths);
   }
   void readLengths(
-      int32_t* FOLLY_NONNULL lengths,
+      int32_t* lengths,
       int32_t numLengths,
-      const uint64_t* FOLLY_NULLABLE /*nulls*/) override {
+      const uint64_t* /*nulls*/) override {
     lengths_.readLengths(lengths, numLengths);
   }
 

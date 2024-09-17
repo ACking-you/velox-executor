@@ -109,9 +109,9 @@ class RowVector : public BaseVector {
     return childrenSize_;
   }
 
-  // Resize a row vector by adding trailing nulls to the top level row without
-  // resizing children.
-  // Caller should ensure that the vector is unique before calling this method.
+  /// Resize a row vector by adding trailing nulls to the top level row without
+  /// resizing children.
+  /// Caller should ensure that the vector is unique before calling this method.
   void appendNulls(vector_size_t numberOfRows);
 
   /// Get the child vector at a given offset.
@@ -167,6 +167,24 @@ class RowVector : public BaseVector {
   void copyRanges(
       const BaseVector* source,
       const folly::Range<const CopyRange*>& ranges) override;
+
+  VectorPtr copyPreserveEncodings(
+      velox::memory::MemoryPool* pool = nullptr) const override {
+    std::vector<VectorPtr> copiedChildren(children_.size());
+
+    for (auto i = 0; i < children_.size(); ++i) {
+      copiedChildren[i] = children_[i]->copyPreserveEncodings(pool);
+    }
+
+    auto selfPool = pool ? pool : pool_;
+    return std::make_shared<RowVector>(
+        selfPool,
+        type_,
+        AlignedBuffer::copy(selfPool, nulls_),
+        length_,
+        copiedChildren,
+        nullCount_);
+  }
 
   uint64_t retainedSize() const override {
     auto size = BaseVector::retainedSize();
@@ -227,6 +245,21 @@ class RowVector : public BaseVector {
   /// Note : If the child is null, then it will stay null after the resize.
   void resize(vector_size_t newSize, bool setNotNull = true) override;
 
+  /// Push all dictionary encoding to the leave vectors of a RowVector tree
+  /// (i.e. we traverse the tree consists of RowVectors, possibly wrapped in
+  /// DictionaryVector, and no traverse into other complex types like array or
+  /// map children).  If the wrapper introduce nulls on RowVector, we don't push
+  /// the dictionary into that RowVector.  The input vector should not contain
+  /// any unloaded lazy.
+  ///
+  /// This is used for example in writing Nimble ArrayWithOffsets and
+  /// SlidingWindowMap.
+  static VectorPtr pushDictionaryToRowVectorLeaves(const VectorPtr& input);
+
+  VectorPtr& rawVectorForBatchReader() {
+    return rawVectorForBatchReader_;
+  }
+
  private:
   vector_size_t childSize() const {
     bool allConstant = false;
@@ -270,10 +303,14 @@ class RowVector : public BaseVector {
   // loadedVector is called, and reset to false when updateContainsLazyNotLoaded
   // is called (i.e. some children are likely updated to lazy).
   mutable bool childrenLoaded_ = false;
+
+  // For some non-selective reader, we need to keep the original vector that is
+  // unprojected and unfilterd, and reuse its memory.
+  VectorPtr rawVectorForBatchReader_;
 };
 
-// Common parent class for ARRAY and MAP vectors.  Contains 'offsets' and
-// 'sizes' data and provide manipulations on them.
+/// Common parent class for ARRAY and MAP vectors.  Contains 'offsets' and
+/// 'sizes' data and provide manipulations on them.
 struct ArrayVectorBase : BaseVector {
   ArrayVectorBase(const ArrayVectorBase&) = delete;
   const BufferPtr& offsets() const {
@@ -318,8 +355,8 @@ struct ArrayVectorBase : BaseVector {
     BaseVector::resize(size, setNotNull);
   }
 
-  // Its the caller responsibility to make sure that `offsets_` and `sizes_` are
-  // safe to write at index i, i.ex not shared, or not large enough.
+  /// Its the caller responsibility to make sure that `offsets_` and `sizes_`
+  /// are safe to write at index i, i.ex not shared, or not large enough.
   void
   setOffsetAndSize(vector_size_t i, vector_size_t offset, vector_size_t size) {
     DCHECK_LT(i, BaseVector::length_);
@@ -327,9 +364,8 @@ struct ArrayVectorBase : BaseVector {
     sizes_->asMutable<vector_size_t>()[i] = size;
   }
 
-  /// Verify that an ArrayVector/MapVector does not contain overlapping [offset,
-  /// size] ranges. Throws in case overlaps are found.
-  void checkRanges() const;
+  /// Check if there is any overlapping [offset, size] ranges.
+  bool hasOverlappingRanges() const;
 
  protected:
   ArrayVectorBase(
@@ -374,6 +410,14 @@ struct ArrayVectorBase : BaseVector {
   const vector_size_t* rawOffsets_;
   BufferPtr sizes_;
   const vector_size_t* rawSizes_;
+
+ private:
+  template <bool kHasNulls>
+  bool maybeHaveOverlappingRanges() const;
+
+  // Returns the next non-null non-empty array/map on or after `index'.
+  template <bool kHasNulls>
+  vector_size_t nextNonEmpty(vector_size_t index) const;
 };
 
 class ArrayVector : public ArrayVectorBase {
@@ -441,6 +485,20 @@ class ArrayVector : public ArrayVectorBase {
   void copyRanges(
       const BaseVector* source,
       const folly::Range<const CopyRange*>& ranges) override;
+
+  VectorPtr copyPreserveEncodings(
+      velox::memory::MemoryPool* pool = nullptr) const override {
+    auto selfPool = pool ? pool : pool_;
+    return std::make_shared<ArrayVector>(
+        selfPool,
+        type_,
+        AlignedBuffer::copy(selfPool, nulls_),
+        length_,
+        AlignedBuffer::copy(selfPool, offsets_),
+        AlignedBuffer::copy(selfPool, sizes_),
+        elements_->copyPreserveEncodings(pool),
+        nullCount_);
+  }
 
   uint64_t retainedSize() const override {
     return BaseVector::retainedSize() + offsets_->capacity() +
@@ -571,6 +629,22 @@ class MapVector : public ArrayVectorBase {
       const BaseVector* source,
       const folly::Range<const CopyRange*>& ranges) override;
 
+  VectorPtr copyPreserveEncodings(
+      velox::memory::MemoryPool* pool = nullptr) const override {
+    auto selfPool = pool ? pool : pool_;
+    return std::make_shared<MapVector>(
+        selfPool,
+        type_,
+        AlignedBuffer::copy(selfPool, nulls_),
+        length_,
+        AlignedBuffer::copy(selfPool, offsets_),
+        AlignedBuffer::copy(selfPool, sizes_),
+        keys_->copyPreserveEncodings(pool),
+        values_->copyPreserveEncodings(pool),
+        nullCount_,
+        sortedKeys_);
+  }
+
   uint64_t retainedSize() const override {
     return BaseVector::retainedSize() + offsets_->capacity() +
         sizes_->capacity() + keys_->retainedSize() + values_->retainedSize();
@@ -582,17 +656,17 @@ class MapVector : public ArrayVectorBase {
 
   std::string toString(vector_size_t index) const override;
 
-  // Sorts all maps smallest key first. This enables linear time
-  // comparison and log time lookup.  This may only be done if there
-  // are no other references to 'map'. Checks that 'map' is uniquely
-  // referenced. This is guaranteed after construction or when
-  // retrieving values from aggregation or join row containers.
+  /// Sorts all maps smallest key first. This enables linear time
+  /// comparison and log time lookup.  This may only be done if there
+  /// are no other references to 'map'. Checks that 'map' is uniquely
+  /// referenced. This is guaranteed after construction or when
+  /// retrieving values from aggregation or join row containers.
   static void canonicalize(
       const std::shared_ptr<MapVector>& map,
       bool useStableSort = false);
 
-  // Returns indices into the map at 'index' such
-  // that keys[indices[i]] < keys[indices[i + 1]].
+  /// Returns indices into the map at 'index' such
+  /// that keys[indices[i]] < keys[indices[i + 1]].
   std::vector<vector_size_t> sortedKeyIndices(vector_size_t index) const;
 
   void ensureWritable(const SelectivityVector& rows) override;
@@ -614,6 +688,14 @@ class MapVector : public ArrayVectorBase {
 
   void validate(const VectorValidateOptions& options) const override;
 
+  /// Update this map vector (base) with a list of map vectors (updates) of same
+  /// size.  Maps are updated row-wise, i.e. for a certain key in each row, we
+  /// keep the entry from the last update map containing the key.  If no update
+  /// map contains the key, we use the entry from base.  Any null map in either
+  /// base or updates creates a null row in the result.
+  std::shared_ptr<MapVector> update(
+      const std::vector<std::shared_ptr<MapVector>>& others) const;
+
  protected:
   virtual void resetDataDependentFlags(const SelectivityVector* rows) override {
     BaseVector::resetDataDependentFlags(rows);
@@ -628,6 +710,10 @@ class MapVector : public ArrayVectorBase {
   // makes a Buffer with 0, 1, 2,... size-1. This is later sorted to
   // get elements in key order in each map.
   BufferPtr elementIndices() const;
+
+  template <TypeKind kKeyTypeKind>
+  std::shared_ptr<MapVector> updateImpl(
+      const std::vector<std::shared_ptr<MapVector>>& others) const;
 
   VectorPtr keys_;
   VectorPtr values_;
@@ -649,4 +735,5 @@ inline BufferPtr allocateOffsets(vector_size_t size, memory::MemoryPool* pool) {
 inline BufferPtr allocateSizes(vector_size_t size, memory::MemoryPool* pool) {
   return AlignedBuffer::allocate<vector_size_t>(size, pool, 0);
 }
+
 } // namespace facebook::velox

@@ -43,7 +43,8 @@ class CompactRowSerializerTest : public ::testing::Test,
 
     auto arena = std::make_unique<StreamArena>(pool_.get());
     auto rowType = asRowType(rowVector->type());
-    auto serializer = serde_->createSerializer(rowType, numRows, arena.get());
+    auto serializer =
+        serde_->createIterativeSerializer(rowType, numRows, arena.get());
 
     Scratch scratch;
     serializer->append(rowVector, folly::Range(rows.data(), numRows), scratch);
@@ -53,7 +54,7 @@ class CompactRowSerializerTest : public ::testing::Test,
     ASSERT_EQ(size, output->tellp());
   }
 
-  ByteInputStream toByteStream(
+  std::unique_ptr<ByteInputStream> toByteStream(
       const std::string_view& input,
       size_t pageSize = 32) {
     auto rawBytes = reinterpret_cast<uint8_t*>(const_cast<char*>(input.data()));
@@ -70,7 +71,7 @@ class CompactRowSerializerTest : public ::testing::Test,
       offset += pageSize;
     }
 
-    return ByteInputStream(std::move(ranges));
+    return std::make_unique<BufferInputStream>(std::move(ranges));
   }
 
   RowVectorPtr deserialize(
@@ -79,7 +80,7 @@ class CompactRowSerializerTest : public ::testing::Test,
     auto byteStream = toByteStream(input);
 
     RowVectorPtr result;
-    serde_->deserialize(&byteStream, pool_.get(), rowType, &result);
+    serde_->deserialize(byteStream.get(), pool_.get(), rowType, &result);
     return result;
   }
 

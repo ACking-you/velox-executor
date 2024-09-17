@@ -15,11 +15,12 @@
  */
 
 #include "velox/connectors/hive/storage_adapters/s3fs/S3FileSystem.h"
+#include "velox/common/config/Config.h"
 #include "velox/common/file/File.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Util.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
-#include "velox/core/Config.h"
+#include "velox/core/QueryConfig.h"
 #include "velox/dwio/common/DataBuffer.h"
 
 #include <fmt/format.h>
@@ -29,6 +30,8 @@
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/client/AdaptiveRetryStrategy.h>
+#include <aws/core/client/DefaultRetryStrategy.h>
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/utils/logging/ConsoleLogSystem.h>
 #include <aws/core/utils/stream/PreallocatedStreamBuf.h>
@@ -69,7 +72,6 @@ Aws::IOStreamFactory AwsWriteableStreamFactory(void* data, int64_t nbytes) {
   return [=]() { return Aws::New<StringViewStream>("", data, nbytes); };
 }
 
-// TODO: Implement retry on failure.
 class S3ReadFile final : public ReadFile {
  public:
   S3ReadFile(const std::string& path, Aws::S3::S3Client* client)
@@ -79,7 +81,13 @@ class S3ReadFile final : public ReadFile {
 
   // Gets the length of the file.
   // Checks if there are any issues reading the file.
-  void initialize() {
+  void initialize(const filesystems::FileOptions& options) {
+    if (options.fileSize.has_value()) {
+      VELOX_CHECK_GE(
+          options.fileSize.value(), 0, "File size must be non-negative");
+      length_ = options.fileSize.value();
+    }
+
     // Make it a no-op if invoked twice.
     if (length_ != -1) {
       return;
@@ -255,6 +263,10 @@ class S3WriteFile::Impl {
       /// (https://github.com/apache/arrow/issues/11934). So we instead default
       /// to application/octet-stream which is less misleading.
       request.SetContentType(kApplicationOctetStream);
+      // The default algorithm used is MD5. However, MD5 is not supported with
+      // fips and can cause a SIGSEGV. Set CRC32 instead which is a standard for
+      // checksum computation and is not restricted by fips.
+      request.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::CRC32);
 
       auto outcome = client_->CreateMultipartUpload(request);
       VELOX_CHECK_AWS_OUTCOME(
@@ -369,6 +381,10 @@ class S3WriteFile::Impl {
       request.SetContentLength(part.size());
       request.SetBody(
           std::make_shared<StringViewStream>(part.data(), part.size()));
+      // The default algorithm used is MD5. However, MD5 is not supported with
+      // fips and can cause a SIGSEGV. Set CRC32 instead which is a standard for
+      // checksum computation and is not restricted by fips.
+      request.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::CRC32);
       auto outcome = client_->UploadPart(request);
       VELOX_CHECK_AWS_OUTCOME(outcome, "Failed to upload", bucket_, key_);
       // Append ETag and part number for this uploaded part.
@@ -378,6 +394,11 @@ class S3WriteFile::Impl {
 
       part.SetPartNumber(uploadState_.partNumber);
       part.SetETag(result.GetETag());
+      // Don't add the checksum to the part if the checksum is empty.
+      // Some filesystems such as IBM COS require this to be not set.
+      if (!result.GetChecksumCRC32().empty()) {
+        part.SetChecksumCRC32(result.GetChecksumCRC32());
+      }
       uploadState_.completedParts.push_back(std::move(part));
     }
   }
@@ -430,7 +451,7 @@ struct AwsInstance {
   }
 
   // Returns true iff the instance was newly initialized with config.
-  bool initialize(const Config* config) {
+  bool initialize(const config::ConfigBase* config) {
     if (isFinalized_.load()) {
       VELOX_FAIL("Attempt to initialize S3 after it has been finalized.");
     }
@@ -468,9 +489,9 @@ struct AwsInstance {
   }
 
  private:
-  void doInitialize(const Config* config) {
+  void doInitialize(const config::ConfigBase* config) {
     std::shared_ptr<HiveConfig> hiveConfig = std::make_shared<HiveConfig>(
-        std::make_shared<core::MemConfig>(config->values()));
+        std::make_shared<config::ConfigBase>(config->rawConfigsCopy()));
     awsOptions_.loggingOptions.logLevel =
         inferS3LogLevel(hiveConfig->s3GetLogLevel());
     // In some situations, curl triggers a SIGPIPE signal causing the entire
@@ -495,7 +516,7 @@ AwsInstance* getAwsInstance() {
   return instance.get();
 }
 
-bool initializeS3(const Config* config) {
+bool initializeS3(const config::ConfigBase* config) {
   return getAwsInstance()->initialize(config);
 }
 
@@ -508,17 +529,56 @@ void finalizeS3() {
 
 class S3FileSystem::Impl {
  public:
-  Impl(const Config* config) {
+  Impl(const config::ConfigBase* config) {
     hiveConfig_ = std::make_shared<HiveConfig>(
-        std::make_shared<core::MemConfig>(config->values()));
+        std::make_shared<config::ConfigBase>(config->rawConfigsCopy()));
     VELOX_CHECK(getAwsInstance()->isInitialized(), "S3 is not initialized");
     Aws::Client::ClientConfiguration clientConfig;
     clientConfig.endpointOverride = hiveConfig_->s3Endpoint();
+
+    if (hiveConfig_->s3UseProxyFromEnv()) {
+      auto proxyConfig = S3ProxyConfigurationBuilder(hiveConfig_->s3Endpoint())
+                             .useSsl(hiveConfig_->s3UseSSL())
+                             .build();
+      if (proxyConfig.has_value()) {
+        clientConfig.proxyScheme = Aws::Http::SchemeMapper::FromString(
+            proxyConfig.value().scheme().c_str());
+        clientConfig.proxyHost = awsString(proxyConfig.value().host());
+        clientConfig.proxyPort = proxyConfig.value().port();
+        clientConfig.proxyUserName = awsString(proxyConfig.value().username());
+        clientConfig.proxyPassword = awsString(proxyConfig.value().password());
+      }
+    }
 
     if (hiveConfig_->s3UseSSL()) {
       clientConfig.scheme = Aws::Http::Scheme::HTTPS;
     } else {
       clientConfig.scheme = Aws::Http::Scheme::HTTP;
+    }
+
+    if (hiveConfig_->s3ConnectTimeout().has_value()) {
+      clientConfig.connectTimeoutMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              facebook::velox::config::toDuration(
+                  hiveConfig_->s3ConnectTimeout().value()))
+              .count();
+    }
+
+    if (hiveConfig_->s3SocketTimeout().has_value()) {
+      clientConfig.requestTimeoutMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              facebook::velox::config::toDuration(
+                  hiveConfig_->s3SocketTimeout().value()))
+              .count();
+    }
+
+    if (hiveConfig_->s3MaxConnections().has_value()) {
+      clientConfig.maxConnections = hiveConfig_->s3MaxConnections().value();
+    }
+
+    auto retryStrategy = getRetryStrategy();
+    if (retryStrategy.has_value()) {
+      clientConfig.retryStrategy = retryStrategy.value();
     }
 
     auto credentialsProvider = getCredentialsProvider();
@@ -599,6 +659,58 @@ class S3FileSystem::Impl {
     return getDefaultCredentialsProvider();
   }
 
+  // Return a client RetryStrategy based on the config.
+  std::optional<std::shared_ptr<Aws::Client::RetryStrategy>> getRetryStrategy()
+      const {
+    auto retryMode = hiveConfig_->s3RetryMode();
+    auto maxAttempts = hiveConfig_->s3MaxAttempts();
+    if (retryMode.has_value()) {
+      if (retryMode.value() == "standard") {
+        if (maxAttempts.has_value()) {
+          VELOX_USER_CHECK_GE(
+              maxAttempts.value(),
+              0,
+              "Invalid configuration: specified 'hive.s3.max-attempts' value {} is < 0.",
+              maxAttempts.value());
+          return std::make_shared<Aws::Client::StandardRetryStrategy>(
+              maxAttempts.value());
+        } else {
+          // Otherwise, use default value 3.
+          return std::make_shared<Aws::Client::StandardRetryStrategy>();
+        }
+      } else if (retryMode.value() == "adaptive") {
+        if (maxAttempts.has_value()) {
+          VELOX_USER_CHECK_GE(
+              maxAttempts.value(),
+              0,
+              "Invalid configuration: specified 'hive.s3.max-attempts' value {} is < 0.",
+              maxAttempts.value());
+          return std::make_shared<Aws::Client::AdaptiveRetryStrategy>(
+              maxAttempts.value());
+        } else {
+          // Otherwise, use default value 3.
+          return std::make_shared<Aws::Client::AdaptiveRetryStrategy>();
+        }
+      } else if (retryMode.value() == "legacy") {
+        if (maxAttempts.has_value()) {
+          VELOX_USER_CHECK_GE(
+              maxAttempts.value(),
+              0,
+              "Invalid configuration: specified 'hive.s3.max-attempts' value {} is < 0.",
+              maxAttempts.value());
+          return std::make_shared<Aws::Client::DefaultRetryStrategy>(
+              maxAttempts.value());
+        } else {
+          // Otherwise, use default value maxRetries = 10, scaleFactor = 25
+          return std::make_shared<Aws::Client::DefaultRetryStrategy>();
+        }
+      } else {
+        VELOX_USER_FAIL("Invalid retry mode for S3: {}", retryMode.value());
+      }
+    }
+    return std::nullopt;
+  }
+
   // Make it clear that the S3FileSystem instance owns the S3Client.
   // Once the S3FileSystem is destroyed, the S3Client fails to work
   // due to the Aws::ShutdownAPI invocation in the destructor.
@@ -615,7 +727,7 @@ class S3FileSystem::Impl {
   std::shared_ptr<Aws::S3::S3Client> client_;
 };
 
-S3FileSystem::S3FileSystem(std::shared_ptr<const Config> config)
+S3FileSystem::S3FileSystem(std::shared_ptr<const config::ConfigBase> config)
     : FileSystem(config) {
   impl_ = std::make_shared<Impl>(config.get());
 }
@@ -626,10 +738,10 @@ std::string S3FileSystem::getLogLevelName() const {
 
 std::unique_ptr<ReadFile> S3FileSystem::openFileForRead(
     std::string_view path,
-    const FileOptions& /*unused*/) {
+    const FileOptions& options) {
   const auto file = s3Path(path);
   auto s3file = std::make_unique<S3ReadFile>(file, impl_->s3Client());
-  s3file->initialize();
+  s3file->initialize(options);
   return s3file;
 }
 

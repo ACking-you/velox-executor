@@ -44,10 +44,12 @@ class SelectiveStringDirectColumnReader
 
   uint64_t skip(uint64_t numValues) override;
 
-  void read(vector_size_t offset, RowSet rows, const uint64_t* incomingNulls)
-      override;
+  void read(
+      vector_size_t offset,
+      const RowSet& rows,
+      const uint64_t* incomingNulls) override;
 
-  void getValues(RowSet rows, VectorPtr* result) override {
+  void getValues(const RowSet& rows, VectorPtr* result) override {
     rawStringBuffer_ = nullptr;
     rawStringSize_ = 0;
     rawStringUsed_ = 0;
@@ -65,15 +67,6 @@ class SelectiveStringDirectColumnReader
 
   template <typename TVisitor>
   void readWithVisitor(RowSet rows, TVisitor visitor);
-
-  template <typename TFilter, bool isDense, typename ExtractValues>
-  void readHelper(common::Filter* filter, RowSet rows, ExtractValues values);
-
-  template <bool isDense, typename ExtractValues>
-  void processFilter(
-      common::Filter* filter,
-      RowSet rows,
-      ExtractValues extractValues);
 
   void extractCrossBuffers(
       const int32_t* lengths,

@@ -1,4 +1,19 @@
 /*
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
  * Copyright owned by the Transaction Processing Performance Council.
  *
  * A copy of the license is included under extension/tpch/dbgen/LICENSE
@@ -13,7 +28,6 @@
  * Various routines that handle distributions, value selections and
  * seed value management for the DSS benchmark. Current functions:
  * tpch_env_config -- set config vars with optional environment override
- * yes_no -- ask simple yes/no question and return boolean result
  * tpch_a_rnd(min, max) -- random alphanumeric within length range
  * pick_str(size, set) -- select a string from the set of size
  * read_dist(file, name, distribution *) -- read named dist from file
@@ -41,7 +55,7 @@
 #include <ctype.h>
 #include <math.h>
 #ifndef _POSIX_SOURCE
-//#include <malloc.h>
+// #include <malloc.h>
 #endif /* POSIX_SOURCE */
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -51,8 +65,8 @@
 #ifndef _POSIX_
 #include <io.h> // @manual
 #ifndef S_ISREG
-#define S_ISREG(m) (((m)&_S_IFMT) == _S_IFREG)
-#define S_ISFIFO(m) (((m)&_S_IFMT) == _S_IFIFO)
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#define S_ISFIFO(m) (((m) & _S_IFMT) == _S_IFIFO)
 #endif
 #endif
 #ifndef stat
@@ -103,36 +117,6 @@ const char* tpch_env_config(const char* var, const char* dflt) {
     return (evar);
   else
     return (dflt);
-}
-
-/*
- * return the answer to a yes/no question as a boolean
- */
-long yes_no(char* prompt) {
-  char reply[128];
-  (void)prompt;
-#ifdef WIN32
-/* Disable warning about conditional expression is constant */
-#pragma warning(disable : 4127)
-#endif
-
-  while (1) {
-#ifdef WIN32
-#pragma warning(default : 4127)
-#endif
-    printf("%s [Y/N]: ", prompt);
-    fgets(reply, 128, stdin);
-    switch (*reply) {
-      case 'y':
-      case 'Y':
-        return (1);
-      case 'n':
-      case 'N':
-        return (0);
-      default:
-        printf("Please answer 'yes' or 'no'.\n");
-    }
-  }
 }
 
 /*
@@ -427,36 +411,36 @@ char** mk_ascdate(void) {
  */
 DSS_HUGE
 set_state(
-    int table,
+    int table_2,
     long sf,
     long procs,
-    long step,
+    long step_2,
     DSS_HUGE* extra_rows,
     DBGenContext* ctx) {
   int i;
   DSS_HUGE rowcount, result;
 
-  if (sf == 0 || step == 0)
+  if (sf == 0 || step_2 == 0)
     return (0);
 
-  rowcount = ctx->tdefs[table].base;
+  rowcount = ctx->tdefs[table_2].base;
   rowcount *= sf;
   *extra_rows = rowcount % procs;
   rowcount /= procs;
   result = rowcount;
-  for (i = 0; i < step - 1; i++) {
-    if (table == LINE) /* special case for shared seeds */
-      ctx->tdefs[table].gen_seed(1, rowcount);
+  for (i = 0; i < step_2 - 1; i++) {
+    if (table_2 == LINE) /* special case for shared seeds */
+      ctx->tdefs[table_2].gen_seed(1, rowcount);
     else
-      ctx->tdefs[table].gen_seed(0, rowcount);
+      ctx->tdefs[table_2].gen_seed(0, rowcount);
     /* need to set seeds of child in case there's a dependency */
     /* NOTE: this assumes that the parent and child have the same base row
      * count */
-    if (ctx->tdefs[table].child != NONE)
-      ctx->tdefs[ctx->tdefs[table].child].gen_seed(0, rowcount);
+    if (ctx->tdefs[table_2].child != NONE)
+      ctx->tdefs[ctx->tdefs[table_2].child].gen_seed(0, rowcount);
   }
-  if (step > procs) /* moving to the end to generate updates */
-    ctx->tdefs[table].gen_seed(0, *extra_rows);
+  if (step_2 > procs) /* moving to the end to generate updates */
+    ctx->tdefs[table_2].gen_seed(0, *extra_rows);
 
   return (result);
 }

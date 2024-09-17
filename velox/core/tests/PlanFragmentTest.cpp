@@ -67,7 +67,7 @@ class PlanFragmentTest : public testing::Test {
         {QueryConfig::kOrderBySpillEnabled,
          orderBySpillEnabled ? "true" : "false"},
     });
-    return std::make_shared<QueryCtx>(nullptr, std::move(configData));
+    return QueryCtx::create(nullptr, QueryConfig{std::move(configData)});
   }
 
   RowTypePtr rowType_;
@@ -81,7 +81,7 @@ class PlanFragmentTest : public testing::Test {
   std::shared_ptr<memory::MemoryPool> pool_{
       memory::memoryManager()->addLeafPool()};
 };
-}; // namespace
+} // namespace
 
 TEST_F(PlanFragmentTest, orderByCanSpill) {
   struct {
@@ -105,7 +105,8 @@ TEST_F(PlanFragmentTest, orderByCanSpill) {
   for (const auto& testData : testSettings) {
     SCOPED_TRACE(testData.debugString());
 
-    const std::vector<FieldAccessTypedExprPtr> sortingKeys{nullptr};
+    const std::vector<FieldAccessTypedExprPtr> sortingKeys{
+        std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c0")};
     const std::vector<SortOrder> sortingOrders{{true, true}};
     auto orderBy = std::make_shared<OrderByNode>(
         "orderBy", sortingKeys, sortingOrders, false, valueNode_);
@@ -149,7 +150,7 @@ TEST_F(PlanFragmentTest, aggregationCanSpill) {
     std::string debugString() const {
       return fmt::format(
           "aggregationStep:{} isSpillEnabled:{} isAggregationSpillEnabled:{} isDistinct:{} hasPreAggregation:{} expectedCanSpill:{}",
-          aggregationStep,
+          AggregationNode::stepName(aggregationStep),
           isSpillEnabled,
           isAggregationSpillEnabled,
           isDistinct,
@@ -321,4 +322,15 @@ TEST_F(PlanFragmentTest, hashJoin) {
         planFragment.canSpill(queryCtx->queryConfig()),
         testData.expectedCanSpill);
   }
+}
+
+TEST_F(PlanFragmentTest, executionStrategyToString) {
+  ASSERT_EQ(
+      executionStrategyToString(core::ExecutionStrategy::kUngrouped),
+      "UNGROUPED");
+  ASSERT_EQ(
+      executionStrategyToString(core::ExecutionStrategy::kGrouped), "GROUPED");
+  ASSERT_EQ(
+      executionStrategyToString(static_cast<core::ExecutionStrategy>(999)),
+      "UNKNOWN: 999");
 }

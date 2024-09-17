@@ -19,6 +19,7 @@
 #include <folly/ScopeGuard.h>
 
 #include "velox/common/base/Counters.h"
+#include "velox/common/base/Pointers.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TestValue.h"
@@ -34,19 +35,23 @@ using facebook::velox::common::testutil::TestValue;
 namespace facebook::velox::dwrf {
 
 namespace {
+
 dwio::common::StripeProgress getStripeProgress(const WriterContext& context) {
   return dwio::common::StripeProgress{
       .stripeIndex = context.stripeIndex(),
       .stripeRowCount = context.stripeRowCount(),
       .totalMemoryUsage = context.getTotalMemoryUsage(),
-      .stripeSizeEstimate = std::max(
-          context.getEstimatedStripeSize(context.stripeRawSize()),
-          // The stripe size estimate is only more accurate from the second
-          // stripe onward because it uses past stripe states in heuristics.
-          // We need to additionally bound it with output stream size based
-          // estimate for the first stripe.
-          context.stripeIndex() == 0 ? context.getEstimatedOutputStreamSize()
-                                     : 0)};
+      .stripeSizeEstimate = context.linearStripeSizeHeuristics()
+          ? std::max(
+                context.getEstimatedStripeSize(context.stripeRawSize()),
+                // The stripe size estimate is only more accurate from the
+                // second stripe onward because it uses past stripe states in
+                // heuristics. We need to additionally bound it with output
+                // stream size based estimate for the first stripe.
+                context.stripeIndex() == 0
+                    ? context.getEstimatedOutputStreamSize()
+                    : 0)
+          : context.getEstimatedOutputStreamSize()};
 }
 
 #define NON_RECLAIMABLE_SECTION_CHECK() \
@@ -86,7 +91,7 @@ Writer::Writer(
         context.stripeSizeFlushThreshold(),
         context.dictionarySizeFlushThreshold());
   } else {
-    flushPolicy_ = options.flushPolicyFactory();
+    castUniquePointer(options.flushPolicyFactory(), flushPolicy_);
   }
 
   if (options.layoutPlannerFactory != nullptr) {
@@ -183,9 +188,12 @@ void Writer::write(const VectorPtr& input) {
 
     bool doFlush = shouldFlush(context, numRowsToWrite);
     if (doFlush) {
-      // Try abandoning inefficiency dictionary encodings early and see if we
-      // can delay the flush.
-      if (writer_->tryAbandonDictionaries(false)) {
+      // TODO: this is likely not needed after the early dictionary tests.
+      // Should make the decision based on arbitration stats. Then we can
+      // potential simplify a lot of logic around trimming. Try abandoning
+      // inefficiency dictionary encodings early and see if we can delay the
+      // flush.
+      if (writer_->tryAbandonDictionaries(/*force=*/false)) {
         doFlush = shouldFlush(context, numRowsToWrite);
       }
       if (doFlush) {
@@ -222,7 +230,7 @@ void Writer::ensureWriteFits(size_t appendBytes, size_t appendRows) {
 
   // Allows the memory arbitrator to reclaim memory from this file writer if the
   // memory reservation below has triggered memory arbitration.
-  exec::ReclaimableSectionGuard reclaimGuard(nonReclaimableSection_);
+  memory::ReclaimableSectionGuard reclaimGuard(nonReclaimableSection_);
 
   const size_t estimatedAppendMemoryBytes =
       std::max(appendBytes, context.estimateNextWriteSize(appendRows));
@@ -254,7 +262,7 @@ void Writer::ensureStripeFlushFits() {
 
   // Allows the memory arbitrator to reclaim memory from this file writer if the
   // memory reservation below has triggered memory arbitration.
-  exec::ReclaimableSectionGuard reclaimGuard(nonReclaimableSection_);
+  memory::ReclaimableSectionGuard reclaimGuard(nonReclaimableSection_);
 
   auto& context = getContext();
   const size_t estimateFlushMemoryBytes =
@@ -283,11 +291,11 @@ bool Writer::maybeReserveMemory(
   auto& context = getContext();
   auto& pool = context.getMemoryPool(memoryUsageCategory);
   const uint64_t availableReservation = pool.availableReservation();
-  const uint64_t usedReservationBytes = pool.currentBytes();
+  const uint64_t usedBytes = pool.usedBytes();
   const uint64_t minReservationBytes =
-      usedReservationBytes * spillConfig_->minSpillableReservationPct / 100;
+      usedBytes * spillConfig_->minSpillableReservationPct / 100;
   const uint64_t estimatedIncrementBytes =
-      usedReservationBytes * estimatedMemoryGrowthRatio;
+      usedBytes * estimatedMemoryGrowthRatio;
   if ((availableReservation > minReservationBytes) &&
       (availableReservation > 2 * estimatedIncrementBytes)) {
     return true;
@@ -295,15 +303,15 @@ bool Writer::maybeReserveMemory(
 
   const uint64_t bytesToReserve = std::max(
       estimatedIncrementBytes * 2,
-      usedReservationBytes * spillConfig_->spillableReservationGrowthPct / 100);
+      usedBytes * spillConfig_->spillableReservationGrowthPct / 100);
   return pool.maybeReserve(bytesToReserve);
 }
 
-void Writer::releaseMemory() {
+int64_t Writer::releaseMemory() {
   if (!canReclaim()) {
-    return;
+    return 0;
   }
-  getContext().releaseMemoryReservation();
+  return getContext().releaseMemoryReservation();
 }
 
 uint64_t Writer::flushTimeMemoryUsageEstimate(
@@ -333,10 +341,10 @@ bool Writer::shouldFlush(const WriterContext& context, size_t nextWriteRows) {
   // If we are hitting memory budget before satisfying flush criteria, try
   // entering low memory mode to work with less memory-intensive encodings.
   bool overBudget = overMemoryBudget(context, nextWriteRows);
-  bool stripeProgressDecision =
-      flushPolicy_->shouldFlush(getStripeProgress(context));
-  auto dictionaryFlushDecision = flushPolicy_->shouldFlushDictionary(
-      stripeProgressDecision, overBudget, context);
+  const auto stripeProgress = getStripeProgress(context);
+  bool stripeProgressDecision = flushPolicy_->shouldFlush(stripeProgress);
+  const auto dictionaryFlushDecision = flushPolicy_->shouldFlushDictionary(
+      stripeProgressDecision, overBudget, stripeProgress, context);
 
   if (FOLLY_UNLIKELY(
           dictionaryFlushDecision == FlushDecision::ABANDON_DICTIONARY)) {
@@ -348,6 +356,8 @@ bool Writer::shouldFlush(const WriterContext& context, size_t nextWriteRows) {
     overBudget = overMemoryBudget(context, nextWriteRows);
     stripeProgressDecision =
         flushPolicy_->shouldFlush(getStripeProgress(context));
+  } else if (dictionaryFlushDecision == FlushDecision::EVALUATE_DICTIONARY) {
+    writer_->tryAbandonDictionaries(/*force=*/false);
   }
 
   const bool shouldFlush = overBudget || stripeProgressDecision ||
@@ -375,7 +385,7 @@ void Writer::enterLowMemoryMode() {
   if (FOLLY_UNLIKELY(
           context.checkLowMemoryMode() && context.stripeIndex() == 0)) {
     // Idempotent call to switch to less memory intensive encodings.
-    writer_->tryAbandonDictionaries(true);
+    writer_->tryAbandonDictionaries(/*force=*/true);
   }
 }
 
@@ -398,7 +408,7 @@ void Writer::flushStripe(bool close) {
     createRowIndexEntry();
   }
 
-  const auto preFlushMem = context.getTotalMemoryUsage();
+  const auto preFlushTotalMemBytes = context.getTotalMemoryUsage();
   ensureStripeFlushFits();
   // NOTE: ensureStripeFlushFits() might trigger memory arbitration that have
   // flushed the current stripe.
@@ -417,13 +427,16 @@ void Writer::flushStripe(bool close) {
   });
 
   // Collects the memory increment from flushing data to output streams.
+  const auto postFlushStreamMemoryUsage =
+      context.getMemoryUsage(MemoryUsageCategory::OUTPUT_STREAM);
   const auto flushOverhead =
-      context.getMemoryUsage(MemoryUsageCategory::OUTPUT_STREAM) -
-      preFlushStreamMemoryUsage;
-  context.recordFlushOverhead(flushOverhead);
-  metrics.flushOverhead = flushOverhead;
+      postFlushStreamMemoryUsage > preFlushStreamMemoryUsage
+      ? postFlushStreamMemoryUsage - preFlushStreamMemoryUsage
+      : 0;
+  metrics.flushOverhead = static_cast<uint64_t>(flushOverhead);
+  context.recordFlushOverhead(metrics.flushOverhead);
 
-  const auto postFlushMem = context.getTotalMemoryUsage();
+  const auto postFlushTotalMemBytes = context.getTotalMemoryUsage();
 
   auto& sink = writerBase_->getSink();
   auto stripeOffset = sink.size();
@@ -530,7 +543,7 @@ void Writer::flushStripe(bool close) {
   metrics.availableMemory = context.getMemoryBudget() - totalMemoryUsage;
 
   auto& dictionaryPool = context.getMemoryPool(MemoryUsageCategory::DICTIONARY);
-  metrics.dictionaryMemory = dictionaryPool.currentBytes();
+  metrics.dictionaryMemory = dictionaryPool.usedBytes();
   // TODO: what does this try to capture?
   metrics.maxDictSize = dictionaryPool.stats().peakBytes;
 
@@ -543,13 +556,13 @@ void Writer::flushStripe(bool close) {
   metrics.groupSize = 0;
   metrics.close = close;
 
-  LOG(INFO) << fmt::format(
+  VLOG(1) << fmt::format(
       "Stripe {}: Flush overhead = {}, data length = {}, pre flush mem = {}, post flush mem = {}. Closing = {}",
       metrics.stripeIndex,
       metrics.flushOverhead,
       metrics.stripeSize,
-      preFlushMem,
-      postFlushMem,
+      preFlushTotalMemBytes,
+      postFlushTotalMemBytes,
       metrics.close);
   addThreadLocalRuntimeStat(
       "stripeSize",
@@ -710,11 +723,18 @@ bool Writer::MemoryReclaimer::reclaimableBytes(
   if (!writer_->canReclaim()) {
     return false;
   }
-  const uint64_t memoryUsage = writer_->getContext().getTotalMemoryUsage();
-  if (memoryUsage < writer_->spillConfig_->writerFlushThresholdSize) {
+  TestValue::adjust(
+      "facebook::velox::dwrf::Writer::MemoryReclaimer::reclaimableBytes",
+      writer_);
+  const auto& context = writer_->getContext();
+  const auto usedBytes = context.getTotalMemoryUsage();
+  const auto releasableBytes = context.releasableMemoryReservation();
+  const bool flushable =
+      usedBytes >= writer_->spillConfig_->writerFlushThresholdSize;
+  if (releasableBytes == 0 && !flushable) {
     return false;
   }
-  reclaimableBytes = memoryUsage;
+  reclaimableBytes = (flushable ? usedBytes : 0) + releasableBytes;
   return true;
 }
 
@@ -730,7 +750,8 @@ uint64_t Writer::MemoryReclaimer::reclaim(
   if (*writer_->nonReclaimableSection_) {
     RECORD_METRIC_VALUE(kMetricMemoryNonReclaimableCount);
     LOG(WARNING)
-        << "Can't reclaim from dwrf writer which is under non-reclaimable section: "
+        << "Can't reclaim from dwrf writer which is under non-reclaimable "
+           "section: "
         << pool->name();
     ++stats.numNonReclaimableAttempts;
     return 0;
@@ -741,59 +762,52 @@ uint64_t Writer::MemoryReclaimer::reclaim(
     ++stats.numNonReclaimableAttempts;
     return 0;
   }
-  const uint64_t memoryUsage = writer_->getContext().getTotalMemoryUsage();
-  if (memoryUsage < writer_->spillConfig_->writerFlushThresholdSize) {
-    RECORD_METRIC_VALUE(kMetricMemoryNonReclaimableCount);
-    LOG(WARNING)
-        << "Can't reclaim memory from dwrf writer pool " << pool->name()
-        << " which doesn't have sufficient memory to flush, writer memory usage: "
-        << succinctBytes(memoryUsage) << ", writer flush memory threshold: "
-        << succinctBytes(writer_->spillConfig_->writerFlushThresholdSize);
-    ++stats.numNonReclaimableAttempts;
-    return 0;
-  }
 
-  auto reclaimBytes = memory::MemoryReclaimer::run(
+  return memory::MemoryReclaimer::run(
       [&]() {
-        writer_->flushInternal(false);
-        return pool->shrink(targetBytes);
+        int64_t reclaimedBytes{0};
+        {
+          memory::ScopedReclaimedBytesRecorder recorder(pool, &reclaimedBytes);
+          const auto& context = writer_->getContext();
+          const auto usedBytes = context.getTotalMemoryUsage();
+          const auto releasedBytes = writer_->releaseMemory();
+          if (releasedBytes == 0 &&
+              usedBytes < writer_->spillConfig_->writerFlushThresholdSize) {
+            RECORD_METRIC_VALUE(kMetricMemoryNonReclaimableCount);
+            LOG(WARNING)
+                << "Can't reclaim memory from dwrf writer pool " << pool->name()
+                << " which doesn't have sufficient memory to release or flush, "
+                   "writer memory usage: "
+                << succinctBytes(usedBytes)
+                << ", writer memory available reservation: "
+                << succinctBytes(context.availableMemoryReservation())
+                << ", writer flush memory threshold: "
+                << succinctBytes(
+                       writer_->spillConfig_->writerFlushThresholdSize);
+            ++stats.numNonReclaimableAttempts;
+          } else {
+            if (usedBytes >= writer_->spillConfig_->writerFlushThresholdSize) {
+              writer_->flushInternal(false);
+            }
+          }
+        }
+        return reclaimedBytes;
       },
       stats);
-  return reclaimBytes;
-}
-
-dwrf::WriterOptions getDwrfOptions(const dwio::common::WriterOptions& options) {
-  std::map<std::string, std::string> configs;
-  if (options.compressionKind.has_value()) {
-    configs.emplace(
-        Config::COMPRESSION.configKey(),
-        std::to_string(options.compressionKind.value()));
-  }
-
-  if (options.maxStripeSize.has_value()) {
-    configs.emplace(
-        Config::STRIPE_SIZE.configKey(),
-        std::to_string(options.maxStripeSize.value()));
-  }
-  if (options.maxDictionaryMemory.has_value()) {
-    configs.emplace(
-        Config::MAX_DICTIONARY_SIZE.configKey(),
-        std::to_string(options.maxDictionaryMemory.value()));
-  }
-  dwrf::WriterOptions dwrfOptions;
-  dwrfOptions.config = Config::fromMap(configs);
-  dwrfOptions.schema = options.schema;
-  dwrfOptions.memoryPool = options.memoryPool;
-  dwrfOptions.spillConfig = options.spillConfig;
-  dwrfOptions.nonReclaimableSection = options.nonReclaimableSection;
-  return dwrfOptions;
 }
 
 std::unique_ptr<dwio::common::Writer> DwrfWriterFactory::createWriter(
     std::unique_ptr<dwio::common::FileSink> sink,
-    const dwio::common::WriterOptions& options) {
-  auto dwrfOptions = getDwrfOptions(options);
-  return std::make_unique<Writer>(std::move(sink), dwrfOptions);
+    const std::shared_ptr<dwio::common::WriterOptions>& options) {
+  auto dwrfOptions = std::dynamic_pointer_cast<dwrf::WriterOptions>(options);
+  VELOX_CHECK_NOT_NULL(
+      dwrfOptions, "DWRF writer factory expected a DWRF WriterOptions object.");
+  return std::make_unique<Writer>(std::move(sink), *dwrfOptions);
+}
+
+std::unique_ptr<dwio::common::WriterOptions>
+DwrfWriterFactory::createWriterOptions() {
+  return std::make_unique<dwrf::WriterOptions>();
 }
 
 void registerDwrfWriterFactory() {

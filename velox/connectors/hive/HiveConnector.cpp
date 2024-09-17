@@ -21,26 +21,18 @@
 #include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/connectors/hive/HiveDataSource.h"
 #include "velox/connectors/hive/HivePartitionFunction.h"
-// Meta's buck build system needs this check.
-#ifdef VELOX_ENABLE_GCS
-#include "velox/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h" // @manual
-#endif
-#ifdef VELOX_ENABLE_HDFS3
-#include "velox/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h" // @manual
-#endif
-#ifdef VELOX_ENABLE_S3
-#include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h" // @manual
-#endif
-#ifdef VELOX_ENABLE_ABFS
+#include "velox/dwio/dwrf/RegisterDwrfReader.h"
+#include "velox/dwio/dwrf/RegisterDwrfWriter.h"
+
 #include "velox/connectors/hive/storage_adapters/abfs/RegisterAbfsFileSystem.h" // @manual
-#endif
+#include "velox/connectors/hive/storage_adapters/gcs/RegisterGCSFileSystem.h" // @manual
+#include "velox/connectors/hive/storage_adapters/hdfs/RegisterHdfsFileSystem.h" // @manual
+#include "velox/connectors/hive/storage_adapters/s3fs/RegisterS3FileSystem.h" // @manual
 #include "velox/dwio/dwrf/reader/DwrfReader.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
-// Meta's buck build system needs this check.
-#ifdef VELOX_ENABLE_PARQUET
+#include "velox/dwio/orc/reader/OrcReader.h"
 #include "velox/dwio/parquet/RegisterParquetReader.h" // @manual
 #include "velox/dwio/parquet/RegisterParquetWriter.h" // @manual
-#endif
 #include "velox/expression/FieldReference.h"
 
 #include <boost/lexical_cast.hpp>
@@ -53,14 +45,13 @@ namespace facebook::velox::connector::hive {
 
 HiveConnector::HiveConnector(
     const std::string& id,
-    std::shared_ptr<const Config> config,
-    folly::Executor* FOLLY_NULLABLE executor)
+    std::shared_ptr<const config::ConfigBase> config,
+    folly::Executor* executor)
     : Connector(id),
       hiveConfig_(std::make_shared<HiveConfig>(config)),
       fileHandleFactory_(
           hiveConfig_->isFileHandleCacheEnabled()
-              ? std::make_unique<
-                    SimpleLRUCache<std::string, std::shared_ptr<FileHandle>>>(
+              ? std::make_unique<SimpleLRUCache<std::string, FileHandle>>(
                     hiveConfig_->numCacheFileHandles())
               : nullptr,
           std::make_unique<FileHandleGenerator>(config)),
@@ -82,29 +73,14 @@ std::unique_ptr<DataSource> HiveConnector::createDataSource(
         std::string,
         std::shared_ptr<connector::ColumnHandle>>& columnHandles,
     ConnectorQueryCtx* connectorQueryCtx) {
-  dwio::common::ReaderOptions options(connectorQueryCtx->memoryPool());
-  options.setMaxCoalesceBytes(hiveConfig_->maxCoalescedBytes());
-  options.setMaxCoalesceDistance(hiveConfig_->maxCoalescedDistanceBytes());
-  options.setPrefetchRowGroups(hiveConfig_->prefetchRowGroups());
-  options.setLoadQuantum(hiveConfig_->loadQuantum());
-  options.setFileColumnNamesReadAsLowerCase(
-      hiveConfig_->isFileColumnNamesReadAsLowerCase(
-          connectorQueryCtx->sessionProperties()));
-  options.setUseColumnNamesForColumnMapping(
-      hiveConfig_->isOrcUseColumnNames(connectorQueryCtx->sessionProperties()));
-  options.setFooterEstimatedSize(hiveConfig_->footerEstimatedSize());
-  options.setFilePreloadThreshold(hiveConfig_->filePreloadThreshold());
-
   return std::make_unique<HiveDataSource>(
       outputType,
       tableHandle,
       columnHandles,
       &fileHandleFactory_,
-      connectorQueryCtx->expressionEvaluator(),
-      connectorQueryCtx->cache(),
-      connectorQueryCtx->scanId(),
       executor_,
-      options);
+      connectorQueryCtx,
+      hiveConfig_);
 }
 
 std::unique_ptr<DataSink> HiveConnector::createDataSink(
@@ -145,28 +121,19 @@ std::unique_ptr<core::PartitionFunction> HivePartitionFunctionSpec::create(
 }
 
 void HiveConnectorFactory::initialize() {
-  static bool once = []() {
+  [[maybe_unused]] static bool once = []() {
     dwio::common::registerFileSinks();
     dwrf::registerDwrfReaderFactory();
     dwrf::registerDwrfWriterFactory();
-// Meta's buck build system needs this check.
-#ifdef VELOX_ENABLE_PARQUET
+    orc::registerOrcReaderFactory();
+
     parquet::registerParquetReaderFactory();
     parquet::registerParquetWriterFactory();
-#endif
-// Meta's buck build system needs this check.
-#ifdef VELOX_ENABLE_S3
+
     filesystems::registerS3FileSystem();
-#endif
-#ifdef VELOX_ENABLE_HDFS3
     filesystems::registerHdfsFileSystem();
-#endif
-#ifdef VELOX_ENABLE_GCS
     filesystems::registerGCSFileSystem();
-#endif
-#ifdef VELOX_ENABLE_ABFS
     filesystems::abfs::registerAbfsFileSystem();
-#endif
     return true;
   }();
 }

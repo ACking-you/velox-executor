@@ -19,6 +19,8 @@
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/process/ProcessBase.h"
 
+#include <folly/BenchmarkUtil.h>
+
 namespace facebook::velox::bits {
 
 namespace {
@@ -31,12 +33,13 @@ void scatterBitsSimple(
     char* target) {
   int64_t from = numSource - 1;
   for (int64_t to = numTarget - 1; to >= 0; to--) {
-    bool maskIsSet = bits::isBitSet(targetMask, to);
+    const bool maskIsSet = bits::isBitSet(targetMask, to);
     bits::setBit(target, to, maskIsSet && bits::isBitSet(source, from));
     from -= maskIsSet ? 1 : 0;
   }
 }
 
+#ifdef __BMI2__
 // Fetches 'numBits' bits of data, from data starting at lastBit -
 // numbits (inclusive) and ending at lastBit (exclusive). 'lastBit' is
 // updated to be the bit offset of the lowest returned bit. Successive
@@ -56,6 +59,7 @@ uint64_t getBitField(const char* data, int32_t numBits, int32_t& lastBit) {
   lastBit -= numBits;
   return bits;
 }
+#endif
 
 // Copy bits backward while the remaining data is still larger than size of T.
 template <typename T>
@@ -118,6 +122,17 @@ void scatterBits(
   int32_t highBit = numTarget & 7;
   int lowByte = std::max(0, highByte - 7);
   auto maskAsBytes = reinterpret_cast<const char*>(targetMask);
+#if defined(__has_feature)
+#if __has_feature(__address_sanitizer__)
+  int32_t sourceOffset = std::min(0, (numSource / 8) - 7) + 1;
+  folly::doNotOptimizeAway(
+      *reinterpret_cast<const uint64_t*>(source + sourceOffset));
+  folly::doNotOptimizeAway(
+      *reinterpret_cast<const uint64_t*>(maskAsBytes + lowByte + 1));
+  folly::doNotOptimizeAway(*reinterpret_cast<uint64_t*>(target + lowByte + 1));
+#endif
+#endif
+
   // Loop from top to bottom of 'targetMask' up to 64 bits at a time,
   // with a partial word at either end. Count the set bits and fetch
   // as many consecutive bits of source data. Scatter the source bits

@@ -53,6 +53,34 @@ General Aggregate Functions
 
     ``hash`` cannot be null.
 
+.. spark:function:: collect_list(x) -> array<[same as x]>
+
+    Returns an array created from the input ``x`` elements. Ignores null
+    inputs, and returns an empty array when all inputs are null.
+
+.. spark:function:: collect_set(x) -> array<[same as x]>
+
+    Returns an array consisting of all unique values from the input ``x`` elements excluding NULLs.
+    Returns empty array if input is empty or all NULL.
+
+    Example::
+
+        SELECT collect_set(i)
+        FROM (
+            VALUES
+                (1),
+                (null)
+        ) AS t(i);
+        -- ARRAY[1]
+
+        SELECT collect_set(elements)
+        FROM (
+            VALUES
+                ARRAY[1, 2],
+                ARRAY[1, null]
+        ) AS t(elements);
+        -- ARRAY[ARRAY[1, 2], ARRAY[1, null]]
+
 .. spark:function:: first(x) -> x
 
     Returns the first value of `x`.
@@ -61,6 +89,12 @@ General Aggregate Functions
 
     Returns the first non-null value of `x`.
 
+.. spark:function:: kurtosis(x) -> double
+
+    Returns the Pearson's kurtosis of all input values. When the count of `x` is not empty,
+    a non-null output will be generated. When the value of `m2` in the accumulator is 0, a null
+    output will be generated.
+
 .. spark:function:: last(x) -> x
 
     Returns the last value of `x`.
@@ -68,6 +102,11 @@ General Aggregate Functions
 .. spark:function:: last_ignore_null(x) -> x
 
     Returns the last non-null value of `x`.
+
+.. spark:function:: max(x) -> [same as x]
+
+    Returns the maximum value of ``x``.
+    ``x`` must be an orderable type.
 
 .. spark:function:: max_by(x, y) -> [same as x]
 
@@ -86,6 +125,11 @@ General Aggregate Functions
 
     Returns c
 
+.. spark:function:: min(x) -> [same as x]
+
+    Returns the minimum value of ``x``.
+    ``x`` must be an orderable type.
+
 .. spark:function:: min_by(x, y) -> [same as x]
 
     Returns the value of `x` associated with the minimum value of `y`.
@@ -103,17 +147,52 @@ General Aggregate Functions
 
     Returns b
 
+.. spark:function:: mode(x) -> [same as x]
+
+    Returns the most frequent value for the values within ``x``.
+    NULL values are ignored. If all the values are NULL, or
+    there are 0 rows, returns NULL.
+    If multiple values have the same greatest frequency, the 
+    return value could be any one of them.
+
+    Example::
+    
+        SELECT mode(x)
+        FROM (
+            VALUES
+                (0), (10), (10), (null), (null), (null)
+        ) AS t(x);
+
+    Returns 10
+
+.. spark:function:: regr_replacement(x) -> double
+
+    Returns the `m2` (the sum of the second central moment) of input values.
+
+.. spark:function:: skewness(x) -> double
+
+    Returns the skewness of all input values. When the count of `x` is greater than or equal to 1,
+    a non-null output will be generated. When the value of `m2` in the accumulator is 0, a null
+    output will be generated.
+
 .. spark:function:: sum(x) -> bigint|double|real
 
     Returns the sum of `x`.
 
-    Supported types are TINYINT, SMALLINT, INTEGER, BIGINT, REAL and DOUBLE.
+    Supported types are TINYINT, SMALLINT, INTEGER, BIGINT, REAL, DOUBLE and DECIMAL.
 
     When x is of type DOUBLE, the result type is DOUBLE.
     When x is of type REAL, the result type is REAL.
+    When x is of type DECIMAL(p, s), the result type is DECIMAL(p + 10, s), where (p + 10) is capped at 38.
+
     For all other input types, the result type is BIGINT.
 
-    Note: When the sum of BIGINT values exceeds its limit, it cycles to the overflowed value rather than raising an error.
+    Note:
+    When all input values is NULL, for all input types, the result is NULL.
+
+    For DECIMAL type, when an overflow occurs in the accumulation, it returns NULL. For REAL and DOUBLE type, it
+    returns Infinity. For all other input types, when the sum of input values exceeds its limit, it cycles to the
+    overflowed value rather than raising an error.
 
     Example::
 

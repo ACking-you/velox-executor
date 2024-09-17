@@ -38,27 +38,21 @@ class DirectDecoder : public IntDecoder<isSigned> {
   using IntDecoder<isSigned>::skip;
 
   void skipPending() final {
-    auto toSkip = this->pendingSkip;
-    this->pendingSkip = 0;
+    const auto toSkip = this->pendingSkip_;
+    this->pendingSkip_ = 0;
     this->skipLongs(toSkip);
   }
 
   template <typename T>
-  void nextValues(
-      T* FOLLY_NONNULL data,
-      uint64_t numValues,
-      const uint64_t* FOLLY_NULLABLE nulls);
+  void nextValues(T* data, uint64_t numValues, const uint64_t* nulls);
 
-  void next(
-      int64_t* FOLLY_NONNULL data,
-      uint64_t numValues,
-      const uint64_t* FOLLY_NULLABLE nulls) override {
+  void next(int64_t* data, uint64_t numValues, const uint64_t* nulls) override {
     nextValues<int64_t>(data, numValues, nulls);
   }
 
   template <bool hasNulls, typename Visitor>
   void readWithVisitor(
-      const uint64_t* FOLLY_NULLABLE nulls,
+      const uint64_t* nulls,
       Visitor visitor,
       bool useFastPath = true) {
     skipPending();
@@ -69,6 +63,7 @@ class DirectDecoder : public IntDecoder<isSigned> {
         return;
       }
     }
+
     int32_t current = visitor.start();
     this->template skip<hasNulls>(current, 0, nulls);
     const bool allowNulls = hasNulls && visitor.allowNulls();
@@ -102,6 +97,7 @@ class DirectDecoder : public IntDecoder<isSigned> {
       } else {
         toSkip = visitor.process(super::template readInt<int64_t>(), atEnd);
       }
+
     skip:
       ++current;
       if (toSkip) {
@@ -132,24 +128,24 @@ class DirectDecoder : public IntDecoder<isSigned> {
   // Returns a pointer to the next element of 'size' bytes in the
   // buffer. If the element would straddle buffers, it is copied to
   // *temp and temp is returned.
-  const void* FOLLY_NONNULL readFixed(int32_t size, void* FOLLY_NONNULL temp) {
+  const void* readFixed(int32_t size, void* temp) {
     skipPending();
-    auto ptr = super::bufferStart;
-    if (ptr && ptr + size <= super::bufferEnd) {
-      super::bufferStart += size;
+    auto ptr = super::bufferStart_;
+    if (ptr && ptr + size <= super::bufferEnd_) {
+      super::bufferStart_ += size;
       return ptr;
     }
     readBytes(
         size,
-        super::inputStream.get(),
+        super::inputStream_.get(),
         temp,
-        super::bufferStart,
-        super::bufferEnd);
+        super::bufferStart_,
+        super::bufferEnd_);
     return temp;
   }
 
   template <bool hasNulls, typename Visitor>
-  void fastPath(const uint64_t* FOLLY_NULLABLE nulls, Visitor& visitor) {
+  void fastPath(const uint64_t* nulls, Visitor& visitor) {
     using T = typename Visitor::DataType;
     constexpr bool hasFilter =
         !std::
@@ -198,7 +194,7 @@ class DirectDecoder : public IntDecoder<isSigned> {
           return;
         }
       }
-      if (super::useVInts) {
+      if (super::useVInts_) {
         if (Visitor::dense) {
           super::bulkRead(numNonNull, data);
         } else {
@@ -227,15 +223,15 @@ class DirectDecoder : public IntDecoder<isSigned> {
             visitor.rawValues(numRows),
             hasFilter ? visitor.outputRows(numRows) : nullptr,
             numValues,
-            *super::inputStream,
-            super::bufferStart,
-            super::bufferEnd,
+            *super::inputStream_,
+            super::bufferStart_,
+            super::bufferEnd_,
             visitor.filter(),
             visitor.hook());
         this->template skip<false>(tailSkip, 0, nullptr);
       }
     } else {
-      if (super::useVInts) {
+      if (super::useVInts_) {
         if (Visitor::dense) {
           super::bulkRead(numRows, visitor.rawValues(numRows));
         } else {
@@ -263,9 +259,9 @@ class DirectDecoder : public IntDecoder<isSigned> {
             visitor.rawValues(numRows),
             hasFilter ? visitor.outputRows(numRows) : nullptr,
             numValues,
-            *super::inputStream,
-            super::bufferStart,
-            super::bufferEnd,
+            *super::inputStream_,
+            super::bufferStart_,
+            super::bufferEnd_,
             visitor.filter(),
             visitor.hook());
       }

@@ -797,8 +797,8 @@ class VectorMaker {
   ///  {} - empty map
   ///  null - null map
   ///
-  /// @tparam K Type of map keys. Must be an integer: int8_t, int16_t,
-  /// int32_t, int64_t.
+  /// @tparam K Type of map keys. Must be a std::string or an integer: int8_t,
+  /// int16_t, int32_t, int64_t.
   /// @tparam V Type of map value. Can be an integer or a floating point
   /// number.
   /// @param jsonMaps A list of JSON maps. JSON map cannot be an empty
@@ -811,7 +811,8 @@ class VectorMaker {
     static_assert(
         std::is_same_v<K, int8_t> || std::is_same_v<K, int16_t> ||
         std::is_same_v<K, int32_t> || std::is_same_v<K, int64_t> ||
-        std::is_same_v<K, float> || std::is_same_v<K, double>);
+        std::is_same_v<K, float> || std::is_same_v<K, double> ||
+        std::is_same_v<K, std::string>);
 
     std::vector<std::optional<std::vector<std::pair<K, std::optional<V>>>>>
         maps;
@@ -821,6 +822,7 @@ class VectorMaker {
       folly::json::serialization_opts options;
       options.convert_int_keys = true;
       options.allow_non_string_keys = true;
+      options.allow_nan_inf = true;
       folly::dynamic mapObject = folly::parseJson(jsonMap, options);
       if (mapObject.isNull()) {
         // Null map.

@@ -75,7 +75,10 @@ class MapUnionAggregate : public MapAggregateBase<K> {
 
 } // namespace
 
-void registerMapUnionAggregate(const std::string& prefix) {
+void registerMapUnionAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite) {
   std::vector<std::shared_ptr<exec::AggregateFunctionSignature>> signatures{
       exec::AggregateFunctionSignatureBuilder()
           .typeVariable("K")
@@ -96,13 +99,12 @@ void registerMapUnionAggregate(const std::string& prefix) {
           const core::QueryConfig& /*config*/)
           -> std::unique_ptr<exec::Aggregate> {
         VELOX_CHECK_EQ(
-            argTypes.size(),
-            1,
-            "{} ({}): unexpected number of arguments",
-            name);
+            argTypes.size(), 1, "{}: unexpected number of arguments", name);
 
         return createMapAggregate<MapUnionAggregate>(resultType);
-      });
+      },
+      withCompanionFunctions,
+      overwrite);
 }
 
 } // namespace facebook::velox::aggregate::prestosql

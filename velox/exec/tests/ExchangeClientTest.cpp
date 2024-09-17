@@ -13,13 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
+#include <atomic>
+#include <thread>
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/tests/utils/LocalExchangeSource.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
+#include "velox/exec/tests/utils/QueryAssertions.h"
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
@@ -35,13 +39,21 @@ class ExchangeClientTest : public testing::Test,
   }
 
   void SetUp() override {
+    test::testingStartLocalExchangeSource();
+    executor_ = std::make_unique<folly::CPUThreadPoolExecutor>(16);
     exec::ExchangeSource::factories().clear();
     exec::ExchangeSource::registerFactory(test::createLocalExchangeSource);
     if (!isRegisteredVectorSerde()) {
       velox::serializer::presto::PrestoVectorSerde::registerVectorSerde();
     }
-
     bufferManager_ = OutputBufferManager::getInstance().lock();
+
+    common::testutil::TestValue::enable();
+  }
+
+  void TearDown() override {
+    exec::test::waitForAllTasksToBeDeleted();
+    test::testingShutdownLocalExchangeSource();
   }
 
   std::unique_ptr<SerializedPage> toSerializedPage(const RowVectorPtr& vector) {
@@ -58,12 +70,23 @@ class ExchangeClientTest : public testing::Test,
 
   std::shared_ptr<Task> makeTask(
       const std::string& taskId,
-      const core::PlanNodePtr& planNode) {
-    auto queryCtx = std::make_shared<core::QueryCtx>(executor_.get());
+      const std::optional<uint64_t> maxOutputBufferSizeInBytes = {}) {
+    std::unordered_map<std::string, std::string> config;
+    if (maxOutputBufferSizeInBytes.has_value()) {
+      config[core::QueryConfig::kMaxOutputBufferSize] =
+          std::to_string(maxOutputBufferSizeInBytes.value());
+    }
+    auto queryCtx = core::QueryCtx::create(
+        executor_.get(), core::QueryConfig{std::move(config)});
     queryCtx->testingOverrideMemoryPool(
         memory::memoryManager()->addRootPool(queryCtx->queryId()));
+    auto plan = test::PlanBuilder().values({}).planNode();
     return Task::create(
-        taskId, core::PlanFragment{planNode}, 0, std::move(queryCtx));
+        taskId,
+        core::PlanFragment{plan},
+        0,
+        std::move(queryCtx),
+        Task::ExecutionMode::kParallel);
   }
 
   int32_t enqueue(
@@ -79,7 +102,10 @@ class ExchangeClientTest : public testing::Test,
     return pageSize;
   }
 
-  void fetchPages(ExchangeClient& client, int32_t numPages) {
+  std::vector<std::unique_ptr<SerializedPage>> fetchPages(
+      ExchangeClient& client,
+      int32_t numPages) {
+    std::vector<std::unique_ptr<SerializedPage>> allPages;
     for (auto i = 0; i < numPages; ++i) {
       bool atEnd;
       ContinueFuture future;
@@ -89,8 +115,10 @@ class ExchangeClientTest : public testing::Test,
         std::move(future).via(&exec).wait();
         pages = client.next(1, &atEnd, &future);
       }
-      ASSERT_EQ(1, pages.size());
+      EXPECT_EQ(1, pages.size());
+      allPages.push_back(std::move(pages.at(0)));
     }
+    return allPages;
   }
 
   static void addSources(ExchangeQueue& queue, int32_t numSources) {
@@ -119,9 +147,14 @@ class ExchangeClientTest : public testing::Test,
   static std::unique_ptr<SerializedPage> makePage(uint64_t size) {
     auto ioBuf = folly::IOBuf::create(size);
     ioBuf->append(size);
-    return std::make_unique<SerializedPage>(std::move(ioBuf));
+    return std::make_unique<SerializedPage>(std::move(ioBuf), nullptr, 1);
   }
 
+  folly::Executor* executor() const {
+    return executor_.get();
+  }
+
+  std::unique_ptr<folly::CPUThreadPoolExecutor> executor_;
   std::shared_ptr<OutputBufferManager> bufferManager_;
 };
 
@@ -132,16 +165,20 @@ TEST_F(ExchangeClientTest, nonVeloxCreateExchangeSourceException) {
         throw std::runtime_error("Testing error");
       });
 
-  ExchangeClient client("t", 1, pool(), ExchangeClient::kDefaultMaxQueuedBytes);
+  auto client = std::make_shared<ExchangeClient>(
+      "t", 1, ExchangeClient::kDefaultMaxQueuedBytes, pool(), executor());
+
   VELOX_ASSERT_THROW(
-      client.addRemoteTaskId("task.1.2.3"),
+      client->addRemoteTaskId("task.1.2.3"),
       "Failed to create ExchangeSource: Testing error. Task ID: task.1.2.3.");
 
   // Test with a very long task ID. Make sure it is truncated.
   VELOX_ASSERT_THROW(
-      client.addRemoteTaskId(std::string(1024, 'x')),
+      client->addRemoteTaskId(std::string(1024, 'x')),
       "Failed to create ExchangeSource: Testing error. "
       "Task ID: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.");
+
+  client->close();
 }
 
 TEST_F(ExchangeClientTest, stats) {
@@ -151,19 +188,15 @@ TEST_F(ExchangeClientTest, stats) {
       makeRowVector({makeFlatVector<int32_t>({1, 2})}),
   };
 
-  auto plan = test::PlanBuilder()
-                  .values(data)
-                  .partitionedOutput({"c0"}, 100)
-                  .planNode();
   auto taskId = "local://t1";
-  auto task = makeTask(taskId, plan);
+  auto task = makeTask(taskId);
 
   bufferManager_->initializeTask(
       task, core::PartitionedOutputNode::Kind::kPartitioned, 100, 16);
 
-  ExchangeClient client(
-      "t", 17, pool(), ExchangeClient::kDefaultMaxQueuedBytes);
-  client.addRemoteTaskId(taskId);
+  auto client = std::make_shared<ExchangeClient>(
+      "t", 17, ExchangeClient::kDefaultMaxQueuedBytes, pool(), executor());
+  client->addRemoteTaskId(taskId);
 
   // Enqueue 3 pages.
   std::vector<uint64_t> pageBytes;
@@ -174,15 +207,20 @@ TEST_F(ExchangeClientTest, stats) {
     pageBytes.push_back(pageSize);
   }
 
-  fetchPages(client, 3);
+  fetchPages(*client, 3);
 
-  auto stats = client.stats();
-  EXPECT_EQ(totalBytes, stats.at("peakBytes").sum);
-  EXPECT_EQ(data.size(), stats.at("numReceivedPages").sum);
-  EXPECT_EQ(totalBytes / data.size(), stats.at("averageReceivedPageBytes").sum);
+  auto stats = client->stats();
+  // Since we run exchange source response callback in an executor, then we
+  // might start to fetch from the client before all the source buffers are
+  // enqueued.
+  ASSERT_GE(totalBytes, stats.at("peakBytes").sum);
+  ASSERT_EQ(data.size(), stats.at("numReceivedPages").sum);
+  ASSERT_EQ(totalBytes / data.size(), stats.at("averageReceivedPageBytes").sum);
 
   task->requestCancel();
   bufferManager_->removeTask(taskId);
+
+  client->close();
 }
 
 // Test scenario where fetching data from all sources at once would exceed queue
@@ -196,17 +234,14 @@ TEST_F(ExchangeClientTest, flowControl) {
   auto page = toSerializedPage(data);
 
   // Set limit at 3.5 pages.
-  ExchangeClient client("flow.control", 17, pool(), page->size() * 3.5);
+  auto client = std::make_shared<ExchangeClient>(
+      "flow.control", 17, page->size() * 3.5, pool(), executor());
 
-  auto plan = test::PlanBuilder()
-                  .values({data})
-                  .partitionedOutput({"c0"}, 100)
-                  .planNode();
   // Make 10 tasks.
   std::vector<std::shared_ptr<Task>> tasks;
   for (auto i = 0; i < 10; ++i) {
     auto taskId = fmt::format("local://t{}", i);
-    auto task = makeTask(taskId, plan);
+    auto task = makeTask(taskId);
 
     bufferManager_->initializeTask(
         task, core::PartitionedOutputNode::Kind::kPartitioned, 100, 16);
@@ -217,12 +252,12 @@ TEST_F(ExchangeClientTest, flowControl) {
     }
 
     tasks.push_back(task);
-    client.addRemoteTaskId(taskId);
+    client->addRemoteTaskId(taskId);
   }
 
-  fetchPages(client, 3 * tasks.size());
+  fetchPages(*client, 3 * tasks.size());
 
-  auto stats = client.stats();
+  const auto stats = client->stats();
   EXPECT_LE(stats.at("peakBytes").sum, page->size() * 4);
   EXPECT_EQ(30, stats.at("numReceivedPages").sum);
   EXPECT_EQ(page->size(), stats.at("averageReceivedPageBytes").sum);
@@ -231,18 +266,49 @@ TEST_F(ExchangeClientTest, flowControl) {
     task->requestCancel();
     bufferManager_->removeTask(task->taskId());
   }
+
+  client->close();
+}
+
+TEST_F(ExchangeClientTest, largeSinglePage) {
+  auto data = {
+      makeRowVector({makeFlatVector<int64_t>(10000, folly::identity)}),
+      makeRowVector({makeFlatVector<int64_t>(1, folly::identity)}),
+  };
+  auto client =
+      std::make_shared<ExchangeClient>("test", 1, 1000, pool(), executor());
+  auto task = makeTask("local://producer");
+  bufferManager_->initializeTask(
+      task, core::PartitionedOutputNode::Kind::kArbitrary, 1, 1);
+  for (auto& batch : data) {
+    enqueue(task->taskId(), 0, batch);
+  }
+  client->addRemoteTaskId(task->taskId());
+  auto pages = fetchPages(*client, 1);
+  ASSERT_EQ(pages.size(), 1);
+  ASSERT_GT(pages[0]->size(), 1000);
+  pages = fetchPages(*client, 1);
+  ASSERT_EQ(pages.size(), 1);
+  ASSERT_LT(pages[0]->size(), 1000);
+  task->requestCancel();
+  bufferManager_->removeTask(task->taskId());
+  client->close();
 }
 
 TEST_F(ExchangeClientTest, multiPageFetch) {
-  ExchangeClient client("test", 17, pool(), 1 << 20);
+  auto client =
+      std::make_shared<ExchangeClient>("test", 17, 1 << 20, pool(), executor());
 
-  bool atEnd;
-  ContinueFuture future;
-  auto pages = client.next(1, &atEnd, &future);
-  ASSERT_EQ(0, pages.size());
-  ASSERT_FALSE(atEnd);
+  {
+    bool atEnd;
+    ContinueFuture future = ContinueFuture::makeEmpty();
+    auto pages = client->next(1, &atEnd, &future);
+    ASSERT_EQ(0, pages.size());
+    ASSERT_FALSE(atEnd);
+    ASSERT_TRUE(future.valid());
+  }
 
-  const auto& queue = client.queue();
+  const auto& queue = client->queue();
   addSources(*queue, 1);
 
   for (auto i = 0; i < 10; ++i) {
@@ -250,47 +316,55 @@ TEST_F(ExchangeClientTest, multiPageFetch) {
   }
 
   // Fetch one page.
-  pages = client.next(1, &atEnd, &future);
+  bool atEnd;
+  ContinueFuture future = ContinueFuture::makeEmpty();
+  auto pages = client->next(1, &atEnd, &future);
   ASSERT_EQ(1, pages.size());
   ASSERT_FALSE(atEnd);
+  ASSERT_FALSE(future.valid());
 
   // Fetch multiple pages. Each page is slightly larger than 1K bytes, hence,
   // only 4 pages fit.
-  pages = client.next(5'000, &atEnd, &future);
+  pages = client->next(5'000, &atEnd, &future);
   ASSERT_EQ(4, pages.size());
   ASSERT_FALSE(atEnd);
+  ASSERT_FALSE(future.valid());
 
   // Fetch the rest of the pages.
-  pages = client.next(10'000, &atEnd, &future);
+  pages = client->next(10'000, &atEnd, &future);
   ASSERT_EQ(5, pages.size());
   ASSERT_FALSE(atEnd);
+  ASSERT_FALSE(future.valid());
 
   // Signal no-more-data.
   enqueue(*queue, nullptr);
 
-  pages = client.next(10'000, &atEnd, &future);
+  pages = client->next(10'000, &atEnd, &future);
   ASSERT_EQ(0, pages.size());
   ASSERT_TRUE(atEnd);
+  ASSERT_FALSE(future.valid());
+
+  client->close();
 }
 
 TEST_F(ExchangeClientTest, sourceTimeout) {
   constexpr int32_t kNumSources = 3;
-  common::testutil::TestValue::enable();
-  ExchangeClient client("test", 17, pool(), 1 << 20);
+  auto client =
+      std::make_shared<ExchangeClient>("test", 17, 1 << 20, pool(), executor());
 
   bool atEnd;
   ContinueFuture future;
-  auto pages = client.next(1, &atEnd, &future);
+  auto pages = client->next(1, &atEnd, &future);
   ASSERT_EQ(0, pages.size());
   ASSERT_FALSE(atEnd);
 
   for (auto i = 0; i < kNumSources; ++i) {
-    client.addRemoteTaskId(fmt::format("local://{}", i));
+    client->addRemoteTaskId(fmt::format("local://{}", i));
   }
-  client.noMoreRemoteTasks();
+  client->noMoreRemoteTasks();
 
   // Fetch a page. No page is found. All sources are fetching.
-  pages = client.next(1, &atEnd, &future);
+  pages = client->next(1, &atEnd, &future);
   EXPECT_TRUE(pages.empty());
 
   std::mutex mutex;
@@ -300,95 +374,241 @@ TEST_F(ExchangeClientTest, sourceTimeout) {
       std::function<void(void*)>(([&](void* source) {
         std::lock_guard<std::mutex> l(mutex);
         sourcesWithTimeout.insert(source);
+        LOG(INFO) << "inside lambda" << source
+                  << " n=" << sourcesWithTimeout.size();
       })));
 
 #ifndef NDEBUG
   // Wait until all sources have timed out at least once.
-  constexpr int32_t kMaxIters =
-      3 * kNumSources * ExchangeClient::kDefaultMaxWaitSeconds;
-  int32_t counter = 0;
-  for (; counter < kMaxIters; ++counter) {
+  auto deadline = std::chrono::system_clock::now() +
+      3 * kNumSources *
+          std::chrono::seconds(ExchangeClient::kRequestDataSizesMaxWait);
+  while (std::chrono::system_clock::now() < deadline) {
     {
       std::lock_guard<std::mutex> l(mutex);
-      if (sourcesWithTimeout.size() == kNumSources) {
+      if (sourcesWithTimeout.size() >= kNumSources) {
         break;
       }
     }
     std::this_thread::sleep_for(std::chrono::seconds(1));
   }
-  ASSERT_LT(counter, kMaxIters);
+  EXPECT_LT(std::chrono::system_clock::now(), deadline);
 #endif
 
-  const auto& queue = client.queue();
+  const auto& queue = client->queue();
   for (auto i = 0; i < 10; ++i) {
     enqueue(*queue, makePage(1'000 + i));
   }
 
   // Fetch one page.
-  pages = client.next(1, &atEnd, &future);
-  ASSERT_EQ(1, pages.size());
-  ASSERT_FALSE(atEnd);
+  pages = client->next(1, &atEnd, &future);
+  EXPECT_EQ(1, pages.size());
+  EXPECT_FALSE(atEnd);
 
   // Fetch multiple pages. Each page is slightly larger than 1K bytes, hence,
   // only 4 pages fit.
-  pages = client.next(5'000, &atEnd, &future);
-  ASSERT_EQ(4, pages.size());
-  ASSERT_FALSE(atEnd);
+  pages = client->next(5'000, &atEnd, &future);
+  EXPECT_EQ(4, pages.size());
+  EXPECT_FALSE(atEnd);
 
   // Fetch the rest of the pages.
-  pages = client.next(10'000, &atEnd, &future);
-  ASSERT_EQ(5, pages.size());
-  ASSERT_FALSE(atEnd);
+  pages = client->next(10'000, &atEnd, &future);
+  EXPECT_EQ(5, pages.size());
+  EXPECT_FALSE(atEnd);
 
   // Signal no-more-data for all sources.
   for (auto i = 0; i < kNumSources; ++i) {
     enqueue(*queue, nullptr);
   }
-  pages = client.next(10'000, &atEnd, &future);
-  ASSERT_EQ(0, pages.size());
-  ASSERT_TRUE(atEnd);
+  pages = client->next(10'000, &atEnd, &future);
+  EXPECT_EQ(0, pages.size());
+  EXPECT_TRUE(atEnd);
+
+  client->close();
 }
 
-TEST_F(ExchangeClientTest, timeoutDuringValueCallback) {
+TEST_F(ExchangeClientTest, callNextAfterClose) {
+  constexpr int32_t kNumSources = 3;
   common::testutil::TestValue::enable();
-  auto row = makeRowVector({makeFlatVector<int32_t>({1, 2, 3})});
+  auto client =
+      std::make_shared<ExchangeClient>("test", 17, 1 << 20, pool(), executor());
 
-  auto plan = test::PlanBuilder()
-                  .values({row})
-                  .partitionedOutput({"c0"}, 100)
-                  .planNode();
-  auto taskId = "local://t1";
-  auto task = makeTask(taskId, plan);
+  bool atEnd;
+  ContinueFuture future;
+  auto pages = client->next(1, &atEnd, &future);
+  ASSERT_EQ(0, pages.size());
+  ASSERT_FALSE(atEnd);
+
+  for (auto i = 0; i < kNumSources; ++i) {
+    client->addRemoteTaskId(fmt::format("local://{}", i));
+  }
+  client->noMoreRemoteTasks();
+
+  // Fetch a page. No page is found. All sources are fetching.
+  pages = client->next(1, &atEnd, &future);
+  EXPECT_TRUE(pages.empty());
+
+  const auto& queue = client->queue();
+  for (auto i = 0; i < 10; ++i) {
+    enqueue(*queue, makePage(1'000 + i));
+  }
+
+  // Fetch multiple pages. Each page is slightly larger than 1K bytes, hence,
+  // only 4 pages fit.
+  pages = client->next(5'000, &atEnd, &future);
+  EXPECT_EQ(4, pages.size());
+  EXPECT_FALSE(atEnd);
+
+  // Close the client and try calling next again.
+  client->close();
+
+  // Here we should have no pages returned, be at end (we are closed) and the
+  // future should be invalid (not based on a valid promise).
+  ContinueFuture futureFinal{ContinueFuture::makeEmpty()};
+  pages = client->next(10'000, &atEnd, &futureFinal);
+  EXPECT_EQ(0, pages.size());
+  EXPECT_TRUE(atEnd);
+  EXPECT_FALSE(futureFinal.valid());
+
+  client->close();
+}
+
+TEST_F(ExchangeClientTest, acknowledge) {
+  const int64_t pageSize = 1024;
+  const int64_t clientBufferSize = pageSize;
+  const int64_t serverBufferSize = 2 * pageSize;
+
+  const auto sourceTaskId = "local://test-acknowledge-source-task";
+  const auto task = makeTask(sourceTaskId, serverBufferSize);
+  auto taskRemoveGuard =
+      folly::makeGuard([bufferManager = bufferManager_, task]() {
+        task->requestCancel();
+        bufferManager->removeTask(task->taskId());
+      });
 
   bufferManager_->initializeTask(
-      task, core::PartitionedOutputNode::Kind::kPartitioned, 100, 16);
+      task, core::PartitionedOutputNode::Kind::kPartitioned, 2, 1);
 
-  ExchangeClient client(
-      "t", 17, pool(), ExchangeClient::kDefaultMaxQueuedBytes);
-  client.addRemoteTaskId(taskId);
-  int32_t numTimeouts = 0;
-  SCOPED_TESTVALUE_SET(
-      "facebook::velox::exec::test::LocalExchangeSource::timeout",
-      std::function<void(void*)>(([&](void* /*ignore*/) { ++numTimeouts; })));
+  auto client = std::make_shared<ExchangeClient>(
+      "local://test-acknowledge-client-task",
+      1,
+      clientBufferSize,
+      pool(),
+      executor());
+  auto clientCloseGuard = folly::makeGuard([client]() { client->close(); });
 
+  std::atomic_int numberOfAcknowledgeRequests{0};
   SCOPED_TESTVALUE_SET(
-      "facebook::velox::exec::test::LocalExchangeSource",
-      std::function<void(void*)>(([&](void* /*pages*/) {
-        std::this_thread::sleep_for(
-            std::chrono::seconds(2 * ExchangeClient::kDefaultMaxWaitSeconds));
+      "facebook::velox::exec::test::LocalExchangeSource::pause",
+      std::function<void(void*)>(([&numberOfAcknowledgeRequests](void*) {
+        numberOfAcknowledgeRequests++;
       })));
 
-  auto thread = std::thread([&]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    enqueue(taskId, 17, row);
-  });
+  {
+    // adding the first page should not block as there is enough space in
+    // the output buffer for two pages
+    ContinueFuture future;
+    bufferManager_->enqueue(sourceTaskId, 1, makePage(pageSize), &future);
+    ASSERT_TRUE(future.isReady());
+  }
 
-  fetchPages(client, 1);
-  thread.join();
-  EXPECT_EQ(0, numTimeouts);
+  {
+    // adding the second page may block but will get unblocked once the
+    // client fetches a single page
+    ContinueFuture future;
+    bufferManager_->enqueue(sourceTaskId, 1, makePage(pageSize), &future);
 
-  task->requestCancel();
-  bufferManager_->removeTask(taskId);
+    // start fetching
+    client->addRemoteTaskId(sourceTaskId);
+    client->noMoreRemoteTasks();
+
+    ASSERT_TRUE(std::move(future)
+                    .via(executor())
+                    .wait(std::chrono::seconds{10})
+                    .isReady());
+
+#ifndef NDEBUG
+    // The client knew there is more data available but could not fetch any more
+    // Explicit acknowledge was required
+    EXPECT_EQ(numberOfAcknowledgeRequests, 1);
+#endif
+  }
+
+  {
+    // adding the third page should block (one page is in the exchange queue,
+    // another two pages are in the output buffer)
+    ContinueFuture enqueueDetachedFuture;
+    bufferManager_->enqueue(
+        sourceTaskId, 1, makePage(pageSize), &enqueueDetachedFuture);
+    ASSERT_FALSE(enqueueDetachedFuture.isReady());
+
+    auto enqueueFuture = std::move(enqueueDetachedFuture)
+                             .via(executor())
+                             .wait(std::chrono::milliseconds{100});
+    ASSERT_FALSE(enqueueFuture.isReady());
+
+    // removing one page from the exchange queue should trigger a fetch and
+    // a subsequent acknowledge to release the output buffer memory
+    bool atEnd;
+    ContinueFuture dequeueDetachedFuture;
+    auto pages = client->next(1, &atEnd, &dequeueDetachedFuture);
+    ASSERT_EQ(1, pages.size());
+    ASSERT_FALSE(atEnd);
+    ASSERT_TRUE(dequeueDetachedFuture.isReady());
+
+    ASSERT_TRUE(
+        std::move(enqueueFuture).wait(std::chrono::seconds{10}).isReady());
+#ifndef NDEBUG
+    // The client knew there is more data available but could not fetch any more
+    // Explicit acknowledge was required
+    EXPECT_EQ(numberOfAcknowledgeRequests, 2);
+#endif
+  }
+
+  // one page is still in the buffer at this point
+  ASSERT_EQ(bufferManager_->getUtilization(sourceTaskId), 0.5);
+
+  auto pages = fetchPages(*client, 1);
+  ASSERT_EQ(1, pages.size());
+
+  {
+    // at this point the output buffer is expected to be empty
+    int attempts = 100;
+    bool outputBuffersEmpty;
+    while (attempts > 0) {
+      attempts--;
+      outputBuffersEmpty = bufferManager_->getUtilization(sourceTaskId) == 0;
+      if (outputBuffersEmpty) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    ASSERT_TRUE(outputBuffersEmpty);
+#ifndef NDEBUG
+    // The output buffer is empty now
+    // Explicit acknowledge is not necessary as a blocking getDataSize is sent
+    // right away
+    EXPECT_EQ(numberOfAcknowledgeRequests, 2);
+#endif
+  }
+
+  pages = fetchPages(*client, 1);
+  ASSERT_EQ(1, pages.size());
+
+  bufferManager_->noMoreData(sourceTaskId);
+
+  bool atEnd;
+  ContinueFuture dequeueEndOfDataFuture;
+  pages = client->next(1, &atEnd, &dequeueEndOfDataFuture);
+  ASSERT_EQ(0, pages.size());
+
+  ASSERT_TRUE(std::move(dequeueEndOfDataFuture)
+                  .via(executor())
+                  .wait(std::chrono::seconds{10})
+                  .isReady());
+  pages = client->next(1, &atEnd, &dequeueEndOfDataFuture);
+  ASSERT_EQ(0, pages.size());
+  ASSERT_TRUE(atEnd);
 }
 
 } // namespace

@@ -16,10 +16,10 @@
 
 #include "velox/connectors/hive/storage_adapters/gcs/GCSFileSystem.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/common/config/Config.h"
 #include "velox/common/file/File.h"
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/storage_adapters/gcs/GCSUtil.h"
-#include "velox/core/Config.h"
 #include "velox/exec/tests/utils/TempFilePath.h"
 
 #include <boost/process.hpp>
@@ -139,12 +139,13 @@ class GCSFileSystemTest : public testing::Test {
                              << ">, status=" << object.status();
   }
 
-  std::shared_ptr<const Config> testGcsOptions() const {
+  std::shared_ptr<const config::ConfigBase> testGcsOptions() const {
     std::unordered_map<std::string, std::string> configOverride = {};
 
     configOverride["hive.gcs.scheme"] = "http";
     configOverride["hive.gcs.endpoint"] = "localhost:" + testbench_->port();
-    return std::make_shared<const core::MemConfig>(std::move(configOverride));
+    return std::make_shared<const config::ConfigBase>(
+        std::move(configOverride));
   }
 
   std::string preexistingBucketName() {
@@ -285,30 +286,20 @@ TEST_F(GCSFileSystemTest, missingFile) {
   const std::string gcsFile = gcsURI(preexistingBucketName(), file);
   filesystems::GCSFileSystem gcfs(testGcsOptions());
   gcfs.initializeClient();
-  try {
-    gcfs.openFileForRead(gcsFile);
-    FAIL() << "Expected VeloxException";
-  } catch (VeloxException const& err) {
-    EXPECT_THAT(
-        err.message(),
-        ::testing::HasSubstr(
-            "\\\"message\\\": \\\"Live version of object test1-gcs/newTest.txt does not exist.\\\""));
-  }
+  VELOX_ASSERT_RUNTIME_THROW_CODE(
+      gcfs.openFileForRead(gcsFile),
+      error_code::kFileNotFound,
+      "\\\"message\\\": \\\"Live version of object test1-gcs/newTest.txt does not exist.\\\"");
 }
 
 TEST_F(GCSFileSystemTest, missingBucket) {
   filesystems::GCSFileSystem gcfs(testGcsOptions());
   gcfs.initializeClient();
-  try {
-    const char* gcsFile = "gs://dummy/foo.txt";
-    gcfs.openFileForRead(gcsFile);
-    FAIL() << "Expected VeloxException";
-  } catch (VeloxException const& err) {
-    EXPECT_THAT(
-        err.message(),
-        ::testing::HasSubstr(
-            "\\\"message\\\": \\\"Bucket dummy does not exist.\\\""));
-  }
+  const char* gcsFile = "gs://dummy/foo.txt";
+  VELOX_ASSERT_RUNTIME_THROW_CODE(
+      gcfs.openFileForRead(gcsFile),
+      error_code::kFileNotFound,
+      "\\\"message\\\": \\\"Bucket dummy does not exist.\\\"");
 }
 
 TEST_F(GCSFileSystemTest, credentialsConfig) {
@@ -355,8 +346,8 @@ TEST_F(GCSFileSystemTest, credentialsConfig) {
   })""";
   configOverride["hive.gcs.scheme"] = "http";
   configOverride["hive.gcs.endpoint"] = "localhost:" + testbench_->port();
-  std::shared_ptr<const Config> conf =
-      std::make_shared<const core::MemConfig>(std::move(configOverride));
+  std::shared_ptr<const config::ConfigBase> conf =
+      std::make_shared<const config::ConfigBase>(std::move(configOverride));
 
   filesystems::GCSFileSystem gcfs(conf);
 

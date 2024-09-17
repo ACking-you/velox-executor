@@ -62,6 +62,17 @@ AssertQueryBuilder& AssertQueryBuilder::destination(int32_t destination) {
   return *this;
 }
 
+AssertQueryBuilder& AssertQueryBuilder::serialExecution(bool serial) {
+  if (serial) {
+    params_.serialExecution = true;
+    executor_ = nullptr;
+    return *this;
+  }
+  params_.serialExecution = false;
+  executor_ = newExecutor();
+  return *this;
+}
+
 AssertQueryBuilder& AssertQueryBuilder::config(
     const std::string& key,
     const std::string& value) {
@@ -233,10 +244,11 @@ AssertQueryBuilder::readCursor() {
       // NOTE: the destructor of 'executor_' will wait for all the async task
       // activities to finish on AssertQueryBuilder dtor.
       static std::atomic<uint64_t> cursorQueryId{0};
-      params_.queryCtx = std::make_shared<core::QueryCtx>(
+      params_.queryCtx = core::QueryCtx::create(
           executor_.get(),
           core::QueryConfig({}),
-          std::unordered_map<std::string, std::shared_ptr<Config>>{},
+          std::
+              unordered_map<std::string, std::shared_ptr<config::ConfigBase>>{},
           cache::AsyncDataCache::getInstance(),
           nullptr,
           nullptr,

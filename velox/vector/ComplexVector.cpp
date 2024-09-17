@@ -17,6 +17,7 @@
 #include <optional>
 #include <sstream>
 
+#include "velox/common/base/CheckedArithmetic.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/ComplexVector.h"
@@ -108,6 +109,7 @@ std::optional<int32_t> RowVector::compare(
   }
 
   auto compareSize = std::min(children_.size(), otherRow->children_.size());
+  bool resultIsindeterminate = false;
   for (int32_t i = 0; i < compareSize; ++i) {
     BaseVector* child = children_[i].get();
     BaseVector* otherChild = otherRow->childAt(i).get();
@@ -127,13 +129,19 @@ std::optional<int32_t> RowVector::compare(
     auto wrappedOtherIndex = other->wrappedIndex(otherIndex);
     auto result = child->compare(
         otherChild->loadedVector(), index, wrappedOtherIndex, flags);
-    if (flags.mayStopAtNull() && !result.has_value()) {
-      return std::nullopt;
-    }
-
-    if (result.value()) {
+    if (result == kIndeterminate) {
+      VELOX_DCHECK(
+          flags.equalsOnly,
+          "Compare should have thrown when null is encountered in child.");
+      resultIsindeterminate = true;
+    } else if (result.value() != 0) {
+      // If values are not equal no need to continue looping.
       return result;
     }
+  }
+
+  if (resultIsindeterminate) {
+    return kIndeterminate;
   }
   return children_.size() - otherRow->children_.size();
 }
@@ -217,7 +225,7 @@ void RowVector::copy(
       }
     }
   } else {
-    auto nulls = decodedSource.nulls();
+    auto nulls = decodedSource.nulls(nullptr);
 
     if (nulls) {
       rows.applyToSelected([&](auto row) {
@@ -534,8 +542,9 @@ void ArrayVectorBase::copyRangesImpl(
 
   auto sourceArray = leafSource->asUnchecked<ArrayVectorBase>();
   auto setNotNulls = mayHaveNulls() || source->mayHaveNulls();
-  auto* mutableOffsets = offsets_->asMutable<vector_size_t>();
-  auto* mutableSizes = sizes_->asMutable<vector_size_t>();
+  auto* mutableOffsets =
+      this->mutableOffsets(length_)->asMutable<vector_size_t>();
+  auto* mutableSizes = this->mutableSizes(length_)->asMutable<vector_size_t>();
   vector_size_t childSize = targetValues->get()->size();
   if (ranges.size() == 1 && ranges.back().count == 1) {
     auto& range = ranges.back();
@@ -605,7 +614,7 @@ void ArrayVectorBase::copyRangesImpl(
 
         mutableOffsets[targetIndex] = childSize;
         mutableSizes[targetIndex] = copySize;
-        childSize += copySize;
+        childSize = checkedPlus<vector_size_t>(childSize, copySize);
       }
     });
 
@@ -651,12 +660,12 @@ void RowVector::unsafeResize(vector_size_t newSize, bool setNotNull) {
 }
 
 void RowVector::resize(vector_size_t newSize, bool setNotNull) {
-  auto oldSize = size();
+  const auto oldSize = size();
   BaseVector::resize(newSize, setNotNull);
 
   // Resize all the children.
   for (auto& child : children_) {
-    if (child) {
+    if (child != nullptr) {
       if (child->isLazy()) {
         VELOX_FAIL("Resize on a lazy vector is not allowed");
       }
@@ -672,31 +681,187 @@ void RowVector::resize(vector_size_t newSize, bool setNotNull) {
   }
 }
 
-void ArrayVectorBase::checkRanges() const {
-  std::unordered_map<vector_size_t, vector_size_t> seenElements;
-  seenElements.reserve(size());
+namespace {
 
-  for (vector_size_t i = 0; i < size(); ++i) {
-    auto size = sizeAt(i);
-    auto offset = offsetAt(i);
+struct Wrapper {
+  const VectorPtr& dictionary;
 
-    for (vector_size_t j = 0; j < size; ++j) {
-      auto it = seenElements.find(offset + j);
-      if (it != seenElements.end()) {
-        VELOX_FAIL(
-            "checkRanges() found overlap at idx {}: element {} has offset {} "
-            "and size {}, and element {} has offset {} and size {}.",
-            offset + j,
-            it->second,
-            offsetAt(it->second),
-            sizeAt(it->second),
-            i,
-            offset,
-            size);
-      }
-      seenElements.emplace(offset + j, i);
+  // Combined nulls and indices from this dictionary node to the root.
+  BufferPtr nulls;
+  BufferPtr indices;
+};
+
+void combineWrappers(
+    std::vector<Wrapper>& wrappers,
+    vector_size_t size,
+    memory::MemoryPool* pool) {
+  std::vector<BufferPtr> wrapInfos(wrappers.size());
+  std::vector<const vector_size_t*> sourceIndices(wrappers.size());
+  uint64_t* rawNulls = nullptr;
+  for (int i = 0; i < wrappers.size(); ++i) {
+    wrapInfos[i] = wrappers[i].dictionary->wrapInfo();
+    VELOX_CHECK_NOT_NULL(wrapInfos[i]);
+    sourceIndices[i] = wrapInfos[i]->as<vector_size_t>();
+    if (!rawNulls && wrappers[i].dictionary->nulls()) {
+      wrappers.back().nulls = allocateNulls(size, pool);
+      rawNulls = wrappers.back().nulls->asMutable<uint64_t>();
     }
   }
+  wrappers.back().indices = allocateIndices(size, pool);
+  auto* rawIndices = wrappers.back().indices->asMutable<vector_size_t>();
+  for (vector_size_t j = 0; j < size; ++j) {
+    auto index = j;
+    bool isNull = false;
+    for (int i = 0; i < wrappers.size(); ++i) {
+      if (wrappers[i].dictionary->isNullAt(index)) {
+        isNull = true;
+        break;
+      }
+      index = sourceIndices[i][index];
+    }
+    if (isNull) {
+      bits::setNull(rawNulls, j);
+    } else {
+      rawIndices[j] = index;
+    }
+  }
+}
+
+VectorPtr wrapInDictionary(
+    std::vector<Wrapper>& wrappers,
+    vector_size_t size,
+    const VectorPtr& values,
+    memory::MemoryPool* pool) {
+  if (wrappers.empty()) {
+    VELOX_CHECK_LE(size, values->size());
+    return values;
+  }
+  VELOX_CHECK_LE(size, wrappers.front().dictionary->size());
+  if (wrappers.size() == 1) {
+    if (wrappers.front().dictionary->valueVector() == values) {
+      return wrappers.front().dictionary;
+    }
+    return BaseVector::wrapInDictionary(
+        wrappers.front().dictionary->nulls(),
+        wrappers.front().dictionary->wrapInfo(),
+        size,
+        values);
+  }
+  if (!wrappers.back().indices) {
+    VELOX_CHECK_NULL(wrappers.back().nulls);
+    combineWrappers(wrappers, size, pool);
+  }
+  return BaseVector::wrapInDictionary(
+      wrappers.back().nulls, wrappers.back().indices, size, values);
+}
+
+VectorPtr pushDictionaryToRowVectorLeavesImpl(
+    std::vector<Wrapper>& wrappers,
+    vector_size_t size,
+    const VectorPtr& values,
+    memory::MemoryPool* pool) {
+  switch (values->encoding()) {
+    case VectorEncoding::Simple::LAZY: {
+      auto* lazy = values->asUnchecked<LazyVector>();
+      VELOX_CHECK(lazy->isLoaded());
+      return pushDictionaryToRowVectorLeavesImpl(
+          wrappers, size, lazy->loadedVectorShared(), pool);
+    }
+    case VectorEncoding::Simple::ROW: {
+      VELOX_CHECK_EQ(values->typeKind(), TypeKind::ROW);
+      for (auto& wrapper : wrappers) {
+        if (wrapper.dictionary->nulls()) {
+          return wrapInDictionary(wrappers, size, values, pool);
+        }
+      }
+      auto children = values->asUnchecked<RowVector>()->children();
+      for (auto& child : children) {
+        if (child) {
+          child =
+              pushDictionaryToRowVectorLeavesImpl(wrappers, size, child, pool);
+        }
+      }
+      return std::make_shared<RowVector>(
+          pool,
+          values->type(),
+          values->nulls(),
+          values->size(),
+          std::move(children));
+    }
+    case VectorEncoding::Simple::DICTIONARY: {
+      Wrapper wrapper{values, nullptr, nullptr};
+      wrappers.push_back(wrapper);
+      auto result = pushDictionaryToRowVectorLeavesImpl(
+          wrappers, size, values->valueVector(), pool);
+      wrappers.pop_back();
+      return result;
+    }
+    default:
+      return wrapInDictionary(wrappers, size, values, pool);
+  }
+}
+
+} // namespace
+
+VectorPtr RowVector::pushDictionaryToRowVectorLeaves(const VectorPtr& input) {
+  std::vector<Wrapper> wrappers;
+  return pushDictionaryToRowVectorLeavesImpl(
+      wrappers, input->size(), input, input->pool());
+}
+
+template <bool kHasNulls>
+vector_size_t ArrayVectorBase::nextNonEmpty(vector_size_t i) const {
+  while (i < size() &&
+         ((kHasNulls && bits::isBitNull(rawNulls(), i)) || rawSizes_[i] <= 0)) {
+    ++i;
+  }
+  return i;
+}
+
+template <bool kHasNulls>
+bool ArrayVectorBase::maybeHaveOverlappingRanges() const {
+  vector_size_t curr = 0;
+  curr = nextNonEmpty<kHasNulls>(curr);
+  if (curr >= size()) {
+    return false;
+  }
+  for (;;) {
+    auto next = nextNonEmpty<kHasNulls>(curr + 1);
+    if (next >= size()) {
+      return false;
+    }
+    // This also implicitly ensures rawOffsets_[curr] <= rawOffsets_[next].
+    if (rawOffsets_[curr] + rawSizes_[curr] > rawOffsets_[next]) {
+      return true;
+    }
+    curr = next;
+  }
+}
+
+bool ArrayVectorBase::hasOverlappingRanges() const {
+  if (!(rawNulls() ? maybeHaveOverlappingRanges<true>()
+                   : maybeHaveOverlappingRanges<false>())) {
+    return false;
+  }
+  std::vector<vector_size_t> indices;
+  indices.reserve(size());
+  for (vector_size_t i = 0; i < size(); ++i) {
+    const bool isNull = rawNulls() && bits::isBitNull(rawNulls(), i);
+    if (!isNull && rawSizes_[i] > 0) {
+      indices.push_back(i);
+    }
+  }
+  std::sort(indices.begin(), indices.end(), [&](auto i, auto j) {
+    return rawOffsets_[i] < rawOffsets_[j];
+  });
+  for (vector_size_t i = 1; i < indices.size(); ++i) {
+    auto j = indices[i - 1];
+    auto k = indices[i];
+    if (rawOffsets_[j] + rawSizes_[j] > rawOffsets_[k]) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void ArrayVectorBase::validateArrayVectorBase(
@@ -751,17 +916,23 @@ std::optional<int32_t> compareArrays(
     return 1;
   }
   auto compareSize = std::min(leftRange.size, rightRange.size);
+  bool resultIsindeterminate = false;
   for (auto i = 0; i < compareSize; ++i) {
     auto result =
         left.compare(&right, leftRange.begin + i, rightRange.begin + i, flags);
-    if (flags.mayStopAtNull() && !result.has_value()) {
-      // Null is encountered.
-      return std::nullopt;
-    }
-    if (result.value() != 0) {
+    if (result == kIndeterminate) {
+      VELOX_DCHECK(
+          flags.equalsOnly,
+          "Compare should have thrown when null is encountered in child.");
+      resultIsindeterminate = true;
+    } else if (result.value() != 0) {
       return result;
     }
   }
+  if (resultIsindeterminate) {
+    return kIndeterminate;
+  }
+
   int result = leftRange.size - rightRange.size;
   return flags.ascending ? result : result * -1;
 }
@@ -776,17 +947,26 @@ std::optional<int32_t> compareArrays(
     // return early if not caring about collation order.
     return 1;
   }
+
   auto compareSize = std::min(leftRange.size(), rightRange.size());
+
+  bool resultIsindeterminate = false;
   for (auto i = 0; i < compareSize; ++i) {
     auto result = left.compare(&right, leftRange[i], rightRange[i], flags);
-    if (flags.mayStopAtNull() && !result.has_value()) {
-      // Null is encountered.
-      return std::nullopt;
-    }
-    if (result.value() != 0) {
+    if (result == kIndeterminate) {
+      VELOX_DCHECK(
+          flags.equalsOnly,
+          "Compare should have thrown when null is encountered in child.");
+      resultIsindeterminate = true;
+    } else if (result.value() != 0) {
       return result;
     }
   }
+
+  if (resultIsindeterminate) {
+    return kIndeterminate;
+  }
+
   int result = leftRange.size() - rightRange.size();
   return flags.ascending ? result : result * -1;
 }
@@ -1028,6 +1208,9 @@ std::optional<int32_t> MapVector::compare(
     vector_size_t index,
     vector_size_t otherIndex,
     CompareFlags flags) const {
+  VELOX_CHECK(
+      flags.nullAsValue() || flags.equalsOnly, "Map is not orderable type");
+
   bool isNull = isNullAt(index);
   bool otherNull = other->isNullAt(otherIndex);
   if (isNull || otherNull) {
@@ -1063,16 +1246,13 @@ std::optional<int32_t> MapVector::compare(
 
   auto result =
       compareArrays(*keys_, *otherMap->keys_, leftIndices, rightIndices, flags);
-  VELOX_DCHECK(result.has_value(), "keys can not have null");
+  VELOX_DCHECK(result.has_value(), "Keys may not have nulls or nested nulls");
 
-  if (flags.mayStopAtNull() && !result.has_value()) {
-    return std::nullopt;
-  }
-
-  // Keys are not the same.
+  // Keys are not the same, values not compared.
   if (result.value()) {
     return result;
   }
+
   return compareArrays(
       *values_, *otherMap->values_, leftIndices, rightIndices, flags);
 }
@@ -1303,6 +1483,202 @@ void MapVector::copyRanges(
     const BaseVector* source,
     const folly::Range<const CopyRange*>& ranges) {
   copyRangesImpl(source, ranges, &values_, &keys_);
+}
+
+namespace {
+
+struct UpdateSource {
+  vector_size_t entryIndex;
+  int8_t sourceIndex;
+};
+
+template <typename T>
+class UpdateMapRow {
+ public:
+  void insert(
+      const DecodedVector* decoded,
+      vector_size_t entryIndex,
+      int8_t sourceIndex) {
+    values_[decoded->valueAt<T>(entryIndex)] = {entryIndex, sourceIndex};
+  }
+
+  template <typename F>
+  void forEachEntry(F&& func) {
+    for (auto& [_, source] : values_) {
+      func(source);
+    }
+  }
+
+  void clear() {
+    values_.clear();
+  }
+
+ private:
+  folly::F14FastMap<T, UpdateSource> values_;
+};
+
+template <>
+class UpdateMapRow<void> {
+ public:
+  void insert(
+      const DecodedVector* decoded,
+      vector_size_t entryIndex,
+      int8_t sourceIndex) {
+    references_[{decoded->base(), decoded->index(entryIndex)}] = {
+        entryIndex, sourceIndex};
+  }
+
+  template <typename F>
+  void forEachEntry(F&& func) {
+    for (auto& [_, source] : references_) {
+      func(source);
+    }
+  }
+
+  void clear() {
+    references_.clear();
+  }
+
+ private:
+  struct Reference {
+    const BaseVector* base;
+    vector_size_t index;
+
+    bool operator==(const Reference& other) const {
+      return base->equalValueAt(other.base, index, other.index);
+    }
+  };
+
+  struct ReferenceHasher {
+    uint64_t operator()(const Reference& key) const {
+      return key.base->hashValueAt(key.index);
+    }
+  };
+
+  folly::F14FastMap<Reference, UpdateSource, ReferenceHasher> references_;
+};
+
+} // namespace
+
+template <TypeKind kKeyTypeKind>
+MapVectorPtr MapVector::updateImpl(
+    const std::vector<MapVectorPtr>& others) const {
+  auto newNulls = nulls();
+  bool allocatedNewNulls = false;
+  for (auto& other : others) {
+    if (!other->nulls()) {
+      continue;
+    }
+    if (!newNulls) {
+      newNulls = other->nulls();
+      continue;
+    }
+    if (!allocatedNewNulls) {
+      auto* prevNewNulls = newNulls->as<uint64_t>();
+      newNulls = allocateNulls(size(), pool());
+      allocatedNewNulls = true;
+      bits::andBits(
+          newNulls->asMutable<uint64_t>(),
+          prevNewNulls,
+          other->rawNulls(),
+          0,
+          size());
+    } else {
+      bits::andBits(
+          newNulls->asMutable<uint64_t>(), other->rawNulls(), 0, size());
+    }
+  }
+
+  auto newOffsets = allocateIndices(size(), pool());
+  auto* rawNewOffsets = newOffsets->asMutable<vector_size_t>();
+  auto newSizes = allocateIndices(size(), pool());
+  auto* rawNewSizes = newSizes->asMutable<vector_size_t>();
+
+  std::vector<DecodedVector> keys;
+  keys.reserve(1 + others.size());
+  keys.emplace_back(*keys_);
+  for (auto& other : others) {
+    VELOX_CHECK(*keys_->type() == *other->keys_->type());
+    keys.emplace_back(*other->keys_);
+  }
+  std::vector<std::vector<BaseVector::CopyRange>> ranges(1 + others.size());
+
+  // Subscript symbols in this function:
+  //
+  // i : Top level row index.
+  // j, jj : Key/value vector index.  `jj' is the offset version of `j'.
+  // k : Index into `others' and `ranges' for choosing a map vector.
+  UpdateMapRow<typename TypeTraits<kKeyTypeKind>::NativeType> mapRow;
+  vector_size_t numEntries = 0;
+  for (vector_size_t i = 0; i < size(); ++i) {
+    rawNewOffsets[i] = numEntries;
+    if (newNulls && bits::isBitNull(newNulls->as<uint64_t>(), i)) {
+      rawNewSizes[i] = 0;
+      continue;
+    }
+    bool needUpdate = false;
+    for (auto& other : others) {
+      if (other->sizeAt(i) > 0) {
+        needUpdate = true;
+        break;
+      }
+    }
+    if (!needUpdate) {
+      // Fast path for no update on current row.
+      rawNewSizes[i] = sizeAt(i);
+      if (sizeAt(i) > 0) {
+        ranges[0].push_back({offsetAt(i), numEntries, sizeAt(i)});
+        numEntries += sizeAt(i);
+      }
+      continue;
+    }
+    for (int k = 0; k < keys.size(); ++k) {
+      auto* vector = k == 0 ? this : others[k - 1].get();
+      auto offset = vector->offsetAt(i);
+      auto size = vector->sizeAt(i);
+      for (vector_size_t j = 0; j < size; ++j) {
+        auto jj = offset + j;
+        VELOX_DCHECK(!keys[k].isNullAt(jj));
+        mapRow.insert(&keys[k], jj, k);
+      }
+    }
+    vector_size_t newSize = 0;
+    mapRow.forEachEntry([&](UpdateSource source) {
+      ranges[source.sourceIndex].push_back(
+          {source.entryIndex, numEntries + newSize, 1});
+      ++newSize;
+    });
+    mapRow.clear();
+    rawNewSizes[i] = newSize;
+    numEntries += newSize;
+  }
+
+  auto newKeys = BaseVector::create(mapKeys()->type(), numEntries, pool());
+  auto newValues = BaseVector::create(mapValues()->type(), numEntries, pool());
+  for (int k = 0; k < ranges.size(); ++k) {
+    auto* vector = k == 0 ? this : others[k - 1].get();
+    newKeys->copyRanges(vector->mapKeys().get(), ranges[k]);
+    newValues->copyRanges(vector->mapValues().get(), ranges[k]);
+  }
+
+  return std::make_shared<MapVector>(
+      pool(),
+      type(),
+      std::move(newNulls),
+      size(),
+      std::move(newOffsets),
+      std::move(newSizes),
+      std::move(newKeys),
+      std::move(newValues));
+}
+
+MapVectorPtr MapVector::update(const std::vector<MapVectorPtr>& others) const {
+  VELOX_CHECK(!others.empty());
+  VELOX_CHECK(others.size() < std::numeric_limits<int8_t>::max());
+  for (auto& other : others) {
+    VELOX_CHECK_EQ(size(), other->size());
+  }
+  return VELOX_DYNAMIC_TYPE_DISPATCH(updateImpl, keys_->typeKind(), others);
 }
 
 void RowVector::appendNulls(vector_size_t numberOfRows) {

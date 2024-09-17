@@ -15,8 +15,6 @@
  */
 #pragma once
 
-#include <charconv>
-
 #include "velox/common/base/CountBits.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/CoreTypeSystem.h"
@@ -52,96 +50,151 @@ inline std::exception_ptr makeBadCastException(
       false));
 }
 
-/// @brief Convert the unscaled value of a decimal to varchar and write to raw
-/// string buffer from start position.
-/// @tparam T The type of input value.
-/// @param unscaledValue The input unscaled value.
-/// @param scale The scale of decimal.
-/// @param maxVarcharSize The estimated max size of a varchar.
-/// @param startPosition The start position to write from.
-/// @return A string view.
-template <typename T>
-StringView convertToStringView(
-    T unscaledValue,
-    int32_t scale,
-    int32_t maxVarcharSize,
-    char* const startPosition) {
-  char* writePosition = startPosition;
-  if (unscaledValue == 0) {
-    *writePosition++ = '0';
-    if (scale > 0) {
-      *writePosition++ = '.';
-      // Append leading zeros.
-      std::memset(writePosition, '0', scale);
-      writePosition += scale;
-    }
-  } else {
-    if (unscaledValue < 0) {
-      *writePosition++ = '-';
-      unscaledValue = -unscaledValue;
-    }
-    auto [position, errorCode] = std::to_chars(
-        writePosition,
-        writePosition + maxVarcharSize,
-        unscaledValue / DecimalUtil::kPowersOfTen[scale]);
-    VELOX_DCHECK_EQ(
-        errorCode,
-        std::errc(),
-        "Failed to cast decimal to varchar: {}",
-        std::make_error_code(errorCode).message());
-    writePosition = position;
-
-    if (scale > 0) {
-      *writePosition++ = '.';
-      uint128_t fraction = unscaledValue % DecimalUtil::kPowersOfTen[scale];
-      // Append leading zeros.
-      int numLeadingZeros = std::max(scale - countDigits(fraction), 0);
-      std::memset(writePosition, '0', numLeadingZeros);
-      writePosition += numLeadingZeros;
-      // Append remaining fraction digits.
-      auto result = std::to_chars(
-          writePosition, writePosition + maxVarcharSize, fraction);
-      position = result.ptr;
-      errorCode = result.ec;
-      VELOX_DCHECK_EQ(
-          errorCode,
-          std::errc(),
-          "Failed to cast decimal to varchar: {}",
-          std::make_error_code(errorCode).message());
-      writePosition = position;
-    }
-  }
-  return StringView(startPosition, writePosition - startPosition);
-}
-
 } // namespace
 
-template <bool adjustForTimeZone>
-void CastExpr::castTimestampToDate(
-    const SelectivityVector& rows,
-    const BaseVector& input,
-    exec::EvalCtx& context,
-    VectorPtr& result,
-    const date::time_zone* timeZone) {
-  auto* resultFlatVector = result->as<FlatVector<int32_t>>();
-  static const int32_t kSecsPerDay{86'400};
-  auto inputVector = input.as<SimpleVector<Timestamp>>();
-  applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-    auto input = inputVector->valueAt(row);
-    if constexpr (adjustForTimeZone) {
-      input.toTimezone(*timeZone);
-    }
-    auto seconds = input.getSeconds();
-    if (seconds >= 0 || seconds % kSecsPerDay == 0) {
-      resultFlatVector->set(row, seconds / kSecsPerDay);
+namespace detail {
+
+/// Represent the varchar fragment.
+///
+/// For example:
+/// | value | wholeDigits | fractionalDigits | exponent | sign |
+/// | 9999999999.99 | 9999999999 | 99 | nullopt | 1 |
+/// | 15 | 15 |  | nullopt | 1 |
+/// | 1.5 | 1 | 5 | nullopt | 1 |
+/// | -1.5 | 1 | 5 | nullopt | -1 |
+/// | 31.523e-2 | 31 | 523 | -2 | 1 |
+struct DecimalComponents {
+  std::string_view wholeDigits;
+  std::string_view fractionalDigits;
+  std::optional<int32_t> exponent = std::nullopt;
+  int8_t sign = 1;
+};
+
+// Extract a string view of continuous digits.
+std::string_view extractDigits(const char* s, size_t start, size_t size);
+
+/// Parse decimal components, including whole digits, fractional digits,
+/// exponent and sign, from input chars. Returns error status if input chars
+/// do not represent a valid value.
+Status
+parseDecimalComponents(const char* s, size_t size, DecimalComponents& out);
+
+/// Parse huge int from decimal components. The fractional part is scaled up by
+/// required power of 10, and added with the whole part. Returns error status if
+/// overflows.
+Status parseHugeInt(const DecimalComponents& decimalComponents, int128_t& out);
+
+/// Converts string view to decimal value of given precision and scale.
+/// Derives from Arrow function DecimalFromString. Arrow implementation:
+/// https://github.com/apache/arrow/blob/main/cpp/src/arrow/util/decimal.cc#L637.
+///
+/// Firstly, it parses the varchar to DecimalComponents which contains the
+/// message that can represent a decimal value. Secondly, processes the exponent
+/// to get the scale. Thirdly, compute the rescaled value. Returns status for
+/// the outcome of computing.
+template <typename T>
+Status toDecimalValue(
+    const StringView s,
+    int toPrecision,
+    int toScale,
+    T& decimalValue) {
+  DecimalComponents decimalComponents;
+  if (auto status =
+          parseDecimalComponents(s.data(), s.size(), decimalComponents);
+      !status.ok()) {
+    return Status::UserError("Value is not a number. " + status.message());
+  }
+
+  // Count number of significant digits (without leading zeros).
+  const size_t firstNonZero =
+      decimalComponents.wholeDigits.find_first_not_of('0');
+  size_t significantDigits = decimalComponents.fractionalDigits.size();
+  if (firstNonZero != std::string::npos) {
+    significantDigits += decimalComponents.wholeDigits.size() - firstNonZero;
+  }
+  int32_t parsedPrecision = static_cast<int32_t>(significantDigits);
+
+  int32_t parsedScale = 0;
+  bool roundUp = false;
+  const int32_t fractionSize = decimalComponents.fractionalDigits.size();
+  if (!decimalComponents.exponent.has_value()) {
+    if (fractionSize > toScale) {
+      if (decimalComponents.fractionalDigits[toScale] >= '5') {
+        roundUp = true;
+      }
+      parsedScale = toScale;
+      decimalComponents.fractionalDigits =
+          std::string_view(decimalComponents.fractionalDigits.data(), toScale);
     } else {
-      // For division with negatives, minus 1 to compensate the discarded
-      // fractional part. e.g. -1/86'400 yields 0, yet it should be
-      // considered as -1 day.
-      resultFlatVector->set(row, seconds / kSecsPerDay - 1);
+      parsedScale = fractionSize;
     }
-  });
+  } else {
+    const auto exponent = decimalComponents.exponent.value();
+    parsedScale = -exponent + fractionSize;
+    // Truncate the fractionalDigits.
+    if (parsedScale > toScale) {
+      if (-exponent >= toScale) {
+        // The fractional digits could be dropped.
+        if (fractionSize > 0 && decimalComponents.fractionalDigits[0] >= '5') {
+          roundUp = true;
+        }
+        decimalComponents.fractionalDigits = "";
+        parsedScale -= fractionSize;
+      } else {
+        const auto reduceDigits = exponent + toScale;
+        if (fractionSize > reduceDigits &&
+            decimalComponents.fractionalDigits[reduceDigits] >= '5') {
+          roundUp = true;
+        }
+        decimalComponents.fractionalDigits = std::string_view(
+            decimalComponents.fractionalDigits.data(),
+            std::min(reduceDigits, fractionSize));
+        parsedScale -= fractionSize - decimalComponents.fractionalDigits.size();
+      }
+    }
+  }
+
+  int128_t out = 0;
+  if (auto status = parseHugeInt(decimalComponents, out); !status.ok()) {
+    return status;
+  }
+
+  if (roundUp) {
+    bool overflow = __builtin_add_overflow(out, 1, &out);
+    if (UNLIKELY(overflow)) {
+      return Status::UserError("Value too large.");
+    }
+  }
+  out *= decimalComponents.sign;
+
+  if (parsedScale < 0) {
+    /// Force the scale to be zero, to avoid negative scales (due to
+    /// compatibility issues with external systems such as databases).
+    if (-parsedScale + toScale > LongDecimalType::kMaxPrecision) {
+      return Status::UserError("Value too large.");
+    }
+
+    bool overflow = __builtin_mul_overflow(
+        out, DecimalUtil::kPowersOfTen[-parsedScale + toScale], &out);
+    if (UNLIKELY(overflow)) {
+      return Status::UserError("Value too large.");
+    }
+    parsedPrecision -= parsedScale;
+    parsedScale = toScale;
+  }
+  const auto status = DecimalUtil::rescaleWithRoundUp<int128_t, T>(
+      out,
+      std::min((uint8_t)parsedPrecision, LongDecimalType::kMaxPrecision),
+      parsedScale,
+      toPrecision,
+      toScale,
+      decimalValue);
+  if (!status.ok()) {
+    return Status::UserError("Value too large.");
+  }
+  return status;
 }
+} // namespace detail
 
 template <typename Func>
 void CastExpr::applyToSelectedNoThrowLocal(
@@ -153,7 +206,12 @@ void CastExpr::applyToSelectedNoThrowLocal(
     rows.template applyToSelected([&](auto row) INLINE_LAMBDA {
       try {
         func(row);
-      } catch (...) {
+      } catch (const VeloxException& e) {
+        if (!e.isUserError()) {
+          throw;
+        }
+        result->setNull(row, true);
+      } catch (const std::exception&) {
         result->setNull(row, true);
       }
     });
@@ -177,23 +235,43 @@ void CastExpr::applyToSelectedNoThrowLocal(
 /// The per-row level Kernel
 /// @tparam ToKind The cast target type
 /// @tparam FromKind The expression type
+/// @tparam TPolicy The policy used by the cast
 /// @param row The index of the current row
 /// @param input The input vector (of type FromKind)
 /// @param result The output vector (of type ToKind)
-template <TypeKind ToKind, TypeKind FromKind, bool Truncate, bool LegacyCast>
+template <TypeKind ToKind, TypeKind FromKind, typename TPolicy>
 void CastExpr::applyCastKernel(
     vector_size_t row,
     EvalCtx& context,
     const SimpleVector<typename TypeTraits<FromKind>::NativeType>* input,
     FlatVector<typename TypeTraits<ToKind>::NativeType>* result) {
-  auto setError = [&](const std::string& details) {
+  bool wrapException = true;
+  auto setError = [&](const std::string& details) INLINE_LAMBDA {
     if (setNullInResultAtError()) {
       result->setNull(row, true);
     } else {
-      context.setVeloxExceptionError(
-          row, makeBadCastException(result->type(), *input, row, details));
+      wrapException = false;
+      if (context.captureErrorDetails()) {
+        const auto errorDetails =
+            makeErrorMessage(*input, row, result->type(), details);
+        context.setStatus(row, Status::UserError("{}", errorDetails));
+      } else {
+        context.setStatus(row, Status::UserError());
+      }
     }
   };
+
+  // If castResult has an error, set the error in context. Otherwise, set the
+  // value in castResult directly to result. This lambda should be called only
+  // when ToKind is primitive and is not VARCHAR or VARBINARY.
+  auto setResultOrError = [&](const auto& castResult, vector_size_t row)
+                              INLINE_LAMBDA {
+                                if (castResult.hasError()) {
+                                  setError(castResult.error().message());
+                                } else {
+                                  result->set(row, castResult.value());
+                                }
+                              };
 
   try {
     auto inputRowValue = input->valueAt(row);
@@ -204,15 +282,49 @@ void CastExpr::applyCastKernel(
       if constexpr (
           TypeTraits<ToKind>::isPrimitiveType &&
           TypeTraits<ToKind>::isFixedWidth) {
+        inputRowValue = hooks_->removeWhiteSpaces(inputRowValue);
         if (inputRowValue.size() == 0) {
           setError("Empty string");
           return;
         }
       }
+      if constexpr (ToKind == TypeKind::TIMESTAMP) {
+        const auto castResult = hooks_->castStringToTimestamp(inputRowValue);
+        setResultOrError(castResult, row);
+        return;
+      }
+      if constexpr (ToKind == TypeKind::REAL) {
+        const auto castResult = hooks_->castStringToReal(inputRowValue);
+        setResultOrError(castResult, row);
+        return;
+      }
+      if constexpr (ToKind == TypeKind::DOUBLE) {
+        const auto castResult = hooks_->castStringToDouble(inputRowValue);
+        setResultOrError(castResult, row);
+        return;
+      }
+
+      if constexpr (
+          ToKind == TypeKind::TINYINT || ToKind == TypeKind::SMALLINT ||
+          ToKind == TypeKind::INTEGER || ToKind == TypeKind::BIGINT ||
+          ToKind == TypeKind::HUGEINT) {
+        if constexpr (TPolicy::throwOnUnicode) {
+          VELOX_CHECK(
+              functions::stringCore::isAscii(
+                  inputRowValue.data(), inputRowValue.size()),
+              "Unicode characters are not supported for conversion to integer types");
+        }
+      }
     }
 
-    auto output = util::Converter<ToKind, void, Truncate, LegacyCast>::cast(
-        inputRowValue);
+    const auto castResult =
+        util::Converter<ToKind, void, TPolicy>::tryCast(inputRowValue);
+    if (castResult.hasError()) {
+      setError(castResult.error().message());
+      return;
+    }
+
+    const auto output = castResult.value();
 
     if constexpr (
         ToKind == TypeKind::VARCHAR || ToKind == TypeKind::VARBINARY) {
@@ -225,7 +337,7 @@ void CastExpr::applyCastKernel(
     }
 
   } catch (const VeloxException& ue) {
-    if (!ue.isUserError()) {
+    if (!ue.isUserError() || !wrapException) {
       throw;
     }
     setError(ue.message());
@@ -250,16 +362,25 @@ void CastExpr::applyDecimalCastKernel(
 
   applyToSelectedNoThrowLocal(
       context, rows, castResult, [&](vector_size_t row) {
-        auto rescaledValue = DecimalUtil::rescaleWithRoundUp<TInput, TOutput>(
+        TOutput rescaledValue;
+        const auto status = DecimalUtil::rescaleWithRoundUp<TInput, TOutput>(
             sourceVector->valueAt(row),
             fromPrecisionScale.first,
             fromPrecisionScale.second,
             toPrecisionScale.first,
-            toPrecisionScale.second);
-        if (rescaledValue.has_value()) {
-          castResultRawBuffer[row] = rescaledValue.value();
+            toPrecisionScale.second,
+            rescaledValue);
+        if (status.ok()) {
+          castResultRawBuffer[row] = rescaledValue;
         } else {
-          castResult->setNull(row, true);
+          if (setNullInResultAtError()) {
+            castResult->setNull(row, true);
+          } else {
+            context.setVeloxExceptionError(
+                row,
+                std::make_exception_ptr(VeloxUserError(
+                    std::current_exception(), status.message(), false)));
+          }
         }
       });
 }
@@ -289,6 +410,69 @@ void CastExpr::applyIntToDecimalCastKernel(
       });
 }
 
+template <typename TInput, typename TOutput>
+void CastExpr::applyFloatingPointToDecimalCastKernel(
+    const SelectivityVector& rows,
+    const BaseVector& input,
+    exec::EvalCtx& context,
+    const TypePtr& toType,
+    VectorPtr& result) {
+  const auto floatingInput = input.as<SimpleVector<TInput>>();
+  auto rawResults =
+      result->asUnchecked<FlatVector<TOutput>>()->mutableRawValues();
+  const auto toPrecisionScale = getDecimalPrecisionScale(*toType);
+
+  applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
+    TOutput output;
+    const auto status = DecimalUtil::rescaleFloatingPoint<TInput, TOutput>(
+        floatingInput->valueAt(row),
+        toPrecisionScale.first,
+        toPrecisionScale.second,
+        output);
+    if (status.ok()) {
+      rawResults[row] = output;
+    } else {
+      if (setNullInResultAtError()) {
+        result->setNull(row, true);
+      } else {
+        context.setVeloxExceptionError(
+            row, makeBadCastException(toType, input, row, status.message()));
+      }
+    }
+  });
+}
+
+template <typename T>
+void CastExpr::applyVarcharToDecimalCastKernel(
+    const SelectivityVector& rows,
+    const BaseVector& input,
+    exec::EvalCtx& context,
+    const TypePtr& toType,
+    VectorPtr& result) {
+  auto sourceVector = input.as<SimpleVector<StringView>>();
+  auto rawBuffer = result->asUnchecked<FlatVector<T>>()->mutableRawValues();
+  const auto toPrecisionScale = getDecimalPrecisionScale(*toType);
+
+  rows.applyToSelected([&](auto row) {
+    T decimalValue;
+    const auto status = detail::toDecimalValue<T>(
+        hooks_->removeWhiteSpaces(sourceVector->valueAt(row)),
+        toPrecisionScale.first,
+        toPrecisionScale.second,
+        decimalValue);
+    if (status.ok()) {
+      rawBuffer[row] = decimalValue;
+    } else {
+      if (setNullInResultAtError()) {
+        result->setNull(row, true);
+      } else {
+        context.setVeloxExceptionError(
+            row, makeBadCastException(toType, input, row, status.message()));
+      }
+    }
+  });
+}
+
 template <typename FromNativeType, TypeKind ToKind>
 VectorPtr CastExpr::applyDecimalToFloatCast(
     const SelectivityVector& rows,
@@ -306,8 +490,11 @@ VectorPtr CastExpr::applyDecimalToFloatCast(
   const auto simpleInput = input.as<SimpleVector<FromNativeType>>();
   const auto scaleFactor = DecimalUtil::kPowersOfTen[precisionScale.second];
   applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-    auto output = util::Converter<ToKind, void, false, false>::cast(
-        simpleInput->valueAt(row));
+    const auto output =
+        util::Converter<ToKind>::tryCast(simpleInput->valueAt(row))
+            .thenOrThrow(folly::identity, [&](const Status& status) {
+              VELOX_USER_FAIL("{}", status.message());
+            });
     resultBuffer[row] = output / scaleFactor;
   });
   return result;
@@ -329,37 +516,39 @@ VectorPtr CastExpr::applyDecimalToIntegralCast(
   const auto precisionScale = getDecimalPrecisionScale(*fromType);
   const auto simpleInput = input.as<SimpleVector<FromNativeType>>();
   const auto scaleFactor = DecimalUtil::kPowersOfTen[precisionScale.second];
-  const auto castToIntByTruncate =
-      context.execCtx()->queryCtx()->queryConfig().isCastToIntByTruncate();
-  applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-    auto value = simpleInput->valueAt(row);
-    auto integralPart = value / scaleFactor;
-    if (!castToIntByTruncate) {
+  if (hooks_->truncate()) {
+    applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
+      resultBuffer[row] =
+          static_cast<To>(simpleInput->valueAt(row) / scaleFactor);
+    });
+  } else {
+    applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
+      auto value = simpleInput->valueAt(row);
+      auto integralPart = value / scaleFactor;
       auto fractionPart = value % scaleFactor;
       auto sign = value >= 0 ? 1 : -1;
       bool needsRoundUp =
           (scaleFactor != 1) && (sign * fractionPart >= (scaleFactor >> 1));
       integralPart += needsRoundUp ? sign : 0;
-    }
-
-    if (integralPart > std::numeric_limits<To>::max() ||
-        integralPart < std::numeric_limits<To>::min()) {
-      if (setNullInResultAtError()) {
-        result->setNull(row, true);
-      } else {
-        context.setVeloxExceptionError(
-            row,
-            makeBadCastException(
-                result->type(),
-                input,
-                row,
-                makeErrorMessage(input, row, toType) + "Out of bounds."));
+      if (integralPart > std::numeric_limits<To>::max() ||
+          integralPart < std::numeric_limits<To>::min()) {
+        if (setNullInResultAtError()) {
+          result->setNull(row, true);
+        } else {
+          context.setVeloxExceptionError(
+              row,
+              makeBadCastException(
+                  result->type(),
+                  input,
+                  row,
+                  makeErrorMessage(input, row, toType) + "Out of bounds."));
+        }
+        return;
       }
-      return;
-    }
 
-    resultBuffer[row] = static_cast<To>(integralPart);
-  });
+      resultBuffer[row] = static_cast<To>(integralPart);
+    });
+  }
   return result;
 }
 
@@ -393,28 +582,14 @@ VectorPtr CastExpr::applyDecimalToVarcharCast(
   const auto simpleInput = input.as<SimpleVector<FromNativeType>>();
   int precision = getDecimalPrecisionScale(*fromType).first;
   int scale = getDecimalPrecisionScale(*fromType).second;
-  // A varchar's size is estimated with unscaled value digits, dot, leading
-  // zero, and possible minus sign.
-  int32_t rowSize = precision + 1;
-  if (scale > 0) {
-    ++rowSize; // A dot.
-  }
-  if (precision == scale) {
-    ++rowSize; // Leading zero.
-  }
-
+  auto rowSize = DecimalUtil::maxStringViewSize(precision, scale);
   auto flatResult = result->asFlatVector<StringView>();
   if (StringView::isInline(rowSize)) {
     char inlined[StringView::kInlineSize];
     applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
-      if (simpleInput->isNullAt(row)) {
-        result->setNull(row, true);
-      } else {
-        flatResult->setNoCopy(
-            row,
-            convertToStringView<FromNativeType>(
-                simpleInput->valueAt(row), scale, rowSize, inlined));
-      }
+      auto actualSize = DecimalUtil::castToString<FromNativeType>(
+          simpleInput->valueAt(row), scale, rowSize, inlined);
+      flatResult->setNoCopy(row, StringView(inlined, actualSize));
     });
     return result;
   }
@@ -424,17 +599,13 @@ VectorPtr CastExpr::applyDecimalToVarcharCast(
   char* rawBuffer = buffer->asMutable<char>() + buffer->size();
 
   applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
-    if (simpleInput->isNullAt(row)) {
-      result->setNull(row, true);
-    } else {
-      auto stringView = convertToStringView<FromNativeType>(
-          simpleInput->valueAt(row), scale, rowSize, rawBuffer);
-      flatResult->setNoCopy(row, stringView);
-      if (!stringView.isInline()) {
-        // If string view is inline, correponding bytes on the raw string buffer
-        // are not needed.
-        rawBuffer += stringView.size();
-      }
+    auto actualSize = DecimalUtil::castToString<FromNativeType>(
+        simpleInput->valueAt(row), scale, rowSize, rawBuffer);
+    flatResult->setNoCopy(row, StringView(rawBuffer, actualSize));
+    if (!StringView::isInline(actualSize)) {
+      // If string view is inline, corresponding bytes on the raw string buffer
+      // are not needed.
+      rawBuffer += actualSize;
     }
   });
   // Update the exact buffer size.
@@ -489,60 +660,28 @@ void CastExpr::applyCastPrimitives(
   auto* resultFlatVector = result->as<FlatVector<To>>();
   auto* inputSimpleVector = input.as<SimpleVector<From>>();
 
-  const auto& queryConfig = context.execCtx()->queryCtx()->queryConfig();
-  auto& resultType = resultFlatVector->type();
-
-  if (!queryConfig.isCastToIntByTruncate()) {
-    if (!queryConfig.isLegacyCast()) {
+  switch (hooks_->getPolicy()) {
+    case LegacyCastPolicy:
       applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-        applyCastKernel<ToKind, FromKind, false /*truncate*/, false /*legacy*/>(
+        applyCastKernel<ToKind, FromKind, util::LegacyCastPolicy>(
             row, context, inputSimpleVector, resultFlatVector);
       });
-    } else {
+      break;
+    case PrestoCastPolicy:
       applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-        applyCastKernel<ToKind, FromKind, false /*truncate*/, true /*legacy*/>(
+        applyCastKernel<ToKind, FromKind, util::PrestoCastPolicy>(
             row, context, inputSimpleVector, resultFlatVector);
       });
-    }
-  } else {
-    if (!queryConfig.isLegacyCast()) {
+      break;
+    case SparkCastPolicy:
       applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-        applyCastKernel<ToKind, FromKind, true /*truncate*/, false /*legacy*/>(
+        applyCastKernel<ToKind, FromKind, util::SparkCastPolicy>(
             row, context, inputSimpleVector, resultFlatVector);
       });
-    } else {
-      applyToSelectedNoThrowLocal(context, rows, result, [&](int row) {
-        applyCastKernel<ToKind, FromKind, true /*truncate*/, true /*legacy*/>(
-            row, context, inputSimpleVector, resultFlatVector);
-      });
-    }
-  }
+      break;
 
-  // If we're converting to a TIMESTAMP, check if we need to adjust the
-  // current GMT timezone to the user provided session timezone.
-  if constexpr (ToKind == TypeKind::TIMESTAMP) {
-    // If user explicitly asked us to adjust the timezone.
-    if (queryConfig.adjustTimestampToTimezone()) {
-      auto sessionTzName = queryConfig.sessionTimezone();
-      if (!sessionTzName.empty()) {
-        // When context.throwOnError is false, some rows will be marked as
-        // 'failed'. These rows should not be processed further. 'remainingRows'
-        // will contain a subset of 'rows' that have passed all the checks (e.g.
-        // keys are not nulls and number of keys and values is the same).
-        exec::LocalSelectivityVector remainingRows(context, rows);
-        context.deselectErrors(*remainingRows);
-
-        // locate_zone throws runtime_error if the timezone couldn't be found
-        // (so we're safe to dereference the pointer).
-        auto* timeZone = date::locate_zone(sessionTzName);
-        auto rawTimestamps = resultFlatVector->mutableRawValues();
-
-        applyToSelectedNoThrowLocal(
-            context, *remainingRows, result, [&](int row) {
-              rawTimestamps[row].toGMT(*timeZone);
-            });
-      }
-    }
+    default:
+      VELOX_NYI("Policy {} not yet implemented.", hooks_->getPolicy());
   }
 }
 

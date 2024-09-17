@@ -13,6 +13,7 @@
 # limitations under the License.
 .PHONY: all cmake build clean debug release unit
 
+SHELL=/bin/bash
 BUILD_BASE_DIR=_build
 BUILD_DIR=release
 BUILD_TYPE=Release
@@ -20,6 +21,7 @@ BENCHMARKS_BASIC_DIR=$(BUILD_BASE_DIR)/$(BUILD_DIR)/velox/benchmarks/basic/
 BENCHMARKS_DUMP_DIR=dumps
 TREAT_WARNINGS_AS_ERRORS ?= 1
 ENABLE_WALL ?= 1
+PYTHON_VENV ?= .venv
 
 # Option to make a minimal build. By default set to "OFF"; set to
 # "ON" to only build a minimal set of components. This may override
@@ -50,6 +52,18 @@ ifdef AZURESDK_ROOT_DIR
 CMAKE_FLAGS += -DAZURESDK_ROOT_DIR=$(AZURESDK_ROOT_DIR)
 endif
 
+ifdef CUDA_ARCHITECTURES
+CMAKE_FLAGS += -DCMAKE_CUDA_ARCHITECTURES="$(CUDA_ARCHITECTURES)"
+endif
+
+ifdef CUDA_COMPILER
+CMAKE_FLAGS += -DCMAKE_CUDA_COMPILER="$(CUDA_COMPILER)"
+endif
+
+ifdef CUDA_FLAGS
+CMAKE_FLAGS += -DCMAKE_CUDA_FLAGS="$(CUDA_FLAGS)"
+endif
+
 # Use Ninja if available. If Ninja is used, pass through parallelism control flags.
 USE_NINJA ?= 1
 ifeq ($(USE_NINJA), 1)
@@ -78,7 +92,7 @@ clean:					#: Delete all build artifacts
 
 cmake:					#: Use CMake to create a Makefile build system
 	mkdir -p $(BUILD_BASE_DIR)/$(BUILD_DIR) && \
-	cmake -B \
+	cmake  -B \
 		"$(BUILD_BASE_DIR)/$(BUILD_DIR)" \
 		${CMAKE_FLAGS} \
 		$(GENERATOR) \
@@ -98,8 +112,32 @@ release:				#: Build the release version
 	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=Release && \
 	$(MAKE) build BUILD_DIR=release
 
-min_debug:				#: Minimal build with debugging symbols
+minimal_debug:			#: Minimal build with debugging symbols
 	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_BUILD_MINIMAL=ON"
+	$(MAKE) build BUILD_DIR=debug
+
+min_debug: minimal_debug
+
+minimal:				 #: Minimal build
+	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_BUILD_MINIMAL=ON"
+	$(MAKE) build BUILD_DIR=release
+
+gpu:						 #: Build with GPU support
+	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_GPU=ON"
+	$(MAKE) build BUILD_DIR=release
+
+gpu_debug:			 #: Build with debugging symbols and GPU support
+	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} -DVELOX_ENABLE_GPU=ON"
+	$(MAKE) build BUILD_DIR=debug
+
+dwio:						#: Minimal build with dwio enabled.
+	$(MAKE) cmake BUILD_DIR=release BUILD_TYPE=release EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+																										    							  -DVELOX_BUILD_MINIMAL_WITH_DWIO=ON"
+	$(MAKE) build BUILD_DIR=release
+
+dwio_debug:			#: Minimal build with dwio debugging symbols.
+	$(MAKE) cmake BUILD_DIR=debug BUILD_TYPE=debug EXTRA_CMAKE_FLAGS="${EXTRA_CMAKE_FLAGS} \
+																																	  -DVELOX_BUILD_MINIMAL_WITH_DWIO=ON"
 	$(MAKE) build BUILD_DIR=debug
 
 benchmarks-basic-build:
@@ -125,7 +163,7 @@ unittest: debug			#: Build with debugging and run unit tests
 # Build with debugging and run expression fuzzer test. Use a fixed seed to
 # ensure the tests are reproducible.
 fuzzertest: debug
-	$(BUILD_BASE_DIR)/debug/velox/expression/tests/velox_expression_fuzzer_test \
+	$(BUILD_BASE_DIR)/debug/velox/expression/fuzzer/velox_expression_fuzzer_test \
 			--seed $(FUZZER_SEED) \
 			--duration_sec $(FUZZER_DURATION_SEC) \
 			--repro_persist_path $(FUZZER_REPRO_PERSIST_PATH) \
@@ -133,26 +171,39 @@ fuzzertest: debug
 			--minloglevel=0
 
 format-fix: 			#: Fix formatting issues in the main branch
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py format main --fix
+else
 	scripts/check.py format main --fix
+endif
 
 format-check: 			#: Check for formatting issues on the main branch
 	clang-format --version
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py format main
+else
 	scripts/check.py format main
+endif
 
-header-fix:				#: Fix license header issues in the current branch
+header-fix:			#: Fix license header issues in the current branch
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py header main --fix
+else
 	scripts/check.py header main --fix
+endif
 
 header-check:			#: Check for license header issues on the main branch
+ifneq ("$(wildcard ${PYTHON_VENV}/pyvenv.cfg)","")
+	source ${PYTHON_VENV}/bin/activate; scripts/check.py header main
+else
 	scripts/check.py header main
+endif
 
 circleci-container:			#: Build the linux container for CircleCi
 	$(MAKE) linux-container CONTAINER_NAME=circleci
 
 check-container:
 	$(MAKE) linux-container CONTAINER_NAME=check
-
-velox-torcharrow-container:
-	$(MAKE) linux-container CONTAINER_NAME=velox-torcharrow
 
 linux-container:
 	rm -rf /tmp/docker && \
@@ -170,8 +221,8 @@ python-clean:
 	DEBUG=1 ${PYTHON_EXECUTABLE} setup.py clean
 
 python-build:
-	DEBUG=1 CMAKE_BUILD_PARALLEL_LEVEL=4 ${PYTHON_EXECUTABLE} -m pip install -e .$(extras) --verbose
+	DEBUG=1 CMAKE_BUILD_PARALLEL_LEVEL=${NUM_THREADS} ${PYTHON_EXECUTABLE} -m pip install -e .$(extras) --verbose
 
-python-test: 
+python-test:
 	$(MAKE) python-build extras="[tests]"
 	DEBUG=1 ${PYTHON_EXECUTABLE} -m unittest -v

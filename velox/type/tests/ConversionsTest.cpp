@@ -17,6 +17,7 @@
 #include "gtest/gtest.h"
 #include "velox/common/base/VeloxException.h"
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/type/CppToType.h"
 
 using namespace facebook::velox;
 
@@ -41,15 +42,20 @@ class ConversionsTest : public testing::Test {
     const TypeKind toTypeKind = CppToType<TTo>::typeKind;
 
     auto cast = [&](TFrom input) -> TTo {
+      Expected<TTo> result;
       if (truncate & legacyCast) {
-        return Converter<toTypeKind, void, true, true>::cast(input);
+        VELOX_NYI("No associated cast policy for truncate and legacy cast.");
       } else if (!truncate & legacyCast) {
-        return Converter<toTypeKind, void, false, true>::cast(input);
+        result = Converter<toTypeKind, void, LegacyCastPolicy>::tryCast(input);
       } else if (truncate & !legacyCast) {
-        return Converter<toTypeKind, void, true, false>::cast(input);
+        result = Converter<toTypeKind, void, SparkCastPolicy>::tryCast(input);
       } else {
-        return Converter<toTypeKind, void, false, false>::cast(input);
+        result = Converter<toTypeKind, void, PrestoCastPolicy>::tryCast(input);
       }
+
+      return result.thenOrThrow(folly::identity, [](const Status& status) {
+        VELOX_USER_FAIL(status.message());
+      });
     };
 
     for (auto i = 0; i < input.size(); i++) {
@@ -432,12 +438,15 @@ TEST_F(ConversionsTest, toIntegeralTypes) {
             "1",
             "+1",
             "-100",
+            "\u000f100",
+            "\u000f100\u000f",
+            // unicode space's interspaced with control chars
+            " -100\u000f",
+            " \u000f+100",
+            "\u001f101\u000e",
+            " \u001f-102\u000f ",
         },
-        {
-            1,
-            1,
-            -100,
-        },
+        {1, 1, -100, 100, 100, -100, 100, 101, -102},
         /*truncate*/ false);
 
     // When TRUNCATE = false, invalid cases.
@@ -460,14 +469,17 @@ TEST_F(ConversionsTest, toIntegeralTypes) {
     testConversion<std::string, int8_t>(
         {"1234567"}, {}, /*truncate*/ false, false, /*expectError*/ true);
     testConversion<std::string, int64_t>(
-        {
-            "1a",
-            "",
-            "1'234'567",
-            "1,234,567",
-            "infinity",
-            "nan",
-        },
+        {"1a",
+         "",
+         "1'234'567",
+         "1,234,567",
+         "infinity",
+         "nan",
+         // Unicode spaces and control chars and unicode at the end
+         // Should fail conversion since we do not support unicode digits
+         " \u001f-103٢\u000f ",
+         // All spaces
+         "   \u000f "},
         {},
         /*truncate*/ false,
         false,
@@ -920,20 +932,41 @@ TEST_F(ConversionsTest, toRealAndDouble) {
     // When TRUNCATE = false.
     testConversion<std::string, float>(
         {
-            "1.7E308",
-            "1.",
-            "1",
-            "infinity",
-            "-infinity",
-            "InfiNiTy",
-            "-InfiNiTy",
-            "nan",
-            "nAn",
+            "1.7E308",   "1.",           "1",
+            ".1324",     "1.2345678E19", "1.2345678E8",
+            "1.0E7",     "12345.0",      "0.001",
+            "1.2E-4",    "0.0",          "-0.0",
+            "-1.2E-4",   "-0.001",       "-12345.0",
+            "-1.0E7",    "-1.2345678E8", "-1.2345678E19",
+            " 123",      "123 ",         " 123 ",
+            "infinity",  "-infinity",    "InfiNiTy",
+            "-InfiNiTy", "Inf",          "-Inf",
+            "nan",       "nAn",
         },
         {
             kInf,
             1.0,
             1.0,
+            0.1324,
+            12345678000000000000.0,
+            123456780.0,
+            10'000'000.0,
+            12345.0,
+            0.001,
+            0.00012,
+            0.0,
+            -0.0,
+            -0.00012,
+            -0.001,
+            -12345.0,
+            -10'000'000.0,
+            -123456780.0,
+            -12345678000000000000.0,
+            123.0,
+            123.0,
+            123.0,
+            kInf,
+            -kInf,
             kInf,
             -kInf,
             kInf,
@@ -948,6 +981,19 @@ TEST_F(ConversionsTest, toRealAndDouble) {
         {
             "1.2a",
             "1.2.3",
+            "1.2EE4",
+            "123.4f",
+            "123.4F",
+            "123.4d",
+            "123.4D",
+            "In",
+            "Infx",
+            "-Infx",
+            "nanx",
+            "na",
+            "infinit",
+            "infinityx",
+            "-infinityx",
         },
         {},
         /*truncate*/ false,
@@ -976,14 +1022,14 @@ TEST_F(ConversionsTest, toTimestamp) {
             "2000-01-01",
             "1970-01-01 00:00:00",
             "2000-01-01 12:21:56",
-            "1970-01-01 00:00:00-02:00",
+            "1970-01-01 00:01",
         },
         {
             Timestamp(0, 0),
             Timestamp(946684800, 0),
             Timestamp(0, 0),
             Timestamp(946729316, 0),
-            Timestamp(7200, 0),
+            Timestamp(60, 0),
         });
 
     // Invalid case.

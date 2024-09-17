@@ -32,7 +32,8 @@ void SingleValueAccumulator::write(
     allocator->extendWrite(start_, stream);
   }
 
-  exec::ContainerRowSerde::serialize(*vector, index, stream);
+  static const exec::ContainerRowSerdeOptions options{};
+  exec::ContainerRowSerde::serialize(*vector, index, stream, options);
   allocator->finishWrite(stream, 0);
 }
 
@@ -41,7 +42,7 @@ void SingleValueAccumulator::read(const VectorPtr& vector, vector_size_t index)
   VELOX_CHECK_NOT_NULL(start_.header);
 
   auto stream = HashStringAllocator::prepareRead(start_.header);
-  exec::ContainerRowSerde::deserialize(stream, index, vector.get());
+  exec::ContainerRowSerde::deserialize(*stream, index, vector.get());
 }
 
 bool SingleValueAccumulator::hasValue() const {
@@ -56,7 +57,7 @@ std::optional<int32_t> SingleValueAccumulator::compare(
 
   auto stream = HashStringAllocator::prepareRead(start_.header);
   return exec::ContainerRowSerde::compareWithNulls(
-      stream, decoded, index, compareFlags);
+      *stream, decoded, index, compareFlags);
 }
 
 void SingleValueAccumulator::destroy(HashStringAllocator* allocator) {

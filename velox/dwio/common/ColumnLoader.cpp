@@ -16,6 +16,8 @@
 
 #include "velox/dwio/common/ColumnLoader.h"
 
+#include "velox/common/process/TraceContext.h"
+
 namespace facebook::velox::dwio::common {
 
 // Wraps '*result' in a dictionary to make the contiguous values
@@ -45,13 +47,14 @@ void ColumnLoader::loadInternal(
     ValueHook* hook,
     vector_size_t resultSize,
     VectorPtr* result) {
+  process::TraceContext trace("ColumnLoader::loadInternal");
   VELOX_CHECK_EQ(
       version_,
       structReader_->numReads(),
       "Loading LazyVector after the enclosing reader has moved");
-  auto offset = structReader_->lazyVectorReadOffset();
-  auto incomingNulls = structReader_->nulls();
-  auto outputRows = structReader_->outputRows();
+  const auto offset = structReader_->lazyVectorReadOffset();
+  const auto* incomingNulls = structReader_->nulls();
+  const auto outputRows = structReader_->outputRows();
   raw_vector<vector_size_t> selectedRows;
   RowSet effectiveRows;
   ExceptionContextSetter exceptionContext(
